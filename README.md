@@ -60,6 +60,12 @@ monthly cycle.
 Requires [Rust](https://rustup.rs) 1.88 or newer.
 
 ```sh
+cargo install xavier-cli
+```
+
+This installs the `xavier` binary. To build from a checkout instead:
+
+```sh
 cargo install --path .
 ```
 
@@ -287,3 +293,8 @@ No test touches the network or spends credits.
   matters.
 - Post text is untrusted input. URLs are checked against citations, but a hostile post can
   still influence the model's summary.
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
+option.

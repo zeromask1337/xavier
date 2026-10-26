@@ -1,10 +1,19 @@
 [package]
-name = "xavier"
+name = "xavier-cli"
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Agent-first CLI for searching X posts via xAI X Search"
-publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zeromask1337/xavier"
+readme = "README.md"
+keywords = ["twitter", "xai", "grok", "search", "cli"]
+categories = ["command-line-utilities", "web-programming::http-client"]
+exclude = [".github"]
+
+[lib]
+name = "xavier"
+path = "src/lib.rs"
 
 [[bin]]
 name = "xavier"
