@@ -391,5 +391,5 @@ fn prints_help_and_version() {
         "stderr: {}",
         stderr(&version)
     );
-    assert_eq!(stdout(&version).trim(), "xavier 0.1.0");
+    assert_eq!(stdout(&version).trim(), "xavier 1.0.0");
 }
