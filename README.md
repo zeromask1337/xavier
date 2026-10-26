@@ -2,6 +2,9 @@
 
 # xavier
 
+[![crates.io](https://img.shields.io/crates/v/xavier-cli.svg)](https://crates.io/crates/xavier-cli)
+[![docs.rs](https://img.shields.io/docsrs/xavier-cli)](https://docs.rs/xavier-cli)
+
 Agent-first CLI for searching X posts, written in Rust.
 
 ```console
@@ -58,6 +61,8 @@ monthly cycle.
 ## Install
 
 Requires [Rust](https://rustup.rs) 1.88 or newer.
+
+Install from [crates.io](https://crates.io/crates/xavier-cli):
 
 ```sh
 cargo install xavier-cli
