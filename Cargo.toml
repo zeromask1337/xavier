@@ -1,0 +1,17 @@
+[package]
+name = "xavier"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Agent-first CLI for searching X posts via xAI X Search"
+publish = false
+
+[[bin]]
+name = "xavier"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
