@@ -1,0 +1,49 @@
+{
+  "id": "resp_test_123",
+  "model": "grok-4.7",
+  "created_at": 1781829888,
+  "status": "completed",
+  "store": false,
+  "output": [
+    {
+      "type": "custom_tool_call",
+      "name": "x_keyword_search",
+      "input": "{\"query\":\"grok 4.7\",\"mode\":\"Latest\",\"limit\":\"10\"}",
+      "status": "completed"
+    },
+    {
+      "type": "custom_tool_call",
+      "name": "x_semantic_search",
+      "input": "{\"query\":\"grok discussion\"}",
+      "status": "completed"
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"summary\":\"Mixed reactions.\",\"posts\":[{\"url\":\"https://x.com/alice/status/111\",\"author\":\"@alice\",\"date\":\"2026-10-24\",\"excerpt\":\"  Grok 4.7 is\\n great.  \"},{\"url\":\"https://x.com/bob/status/222\",\"author\":\"bob\",\"date\":\"not-a-date\",\"excerpt\":\"It regressed.\"},{\"url\":\"https://x.com/alice/status/111?s=20\",\"author\":\"alice\",\"date\":\"2026-10-24\",\"excerpt\":\"duplicate\"},{\"url\":\"https://x.com/carol/status/333\",\"author\":\"@carol\",\"date\":null,\"excerpt\":\"Uncited post\"}]}",
+          "annotations": [
+            { "type": "url_citation", "url": "https://x.com/i/status/111" },
+            { "type": "url_citation", "url": "https://x.com/i/status/222" },
+            { "type": "url_citation", "url": "https://twitter.com/i/web/status/444" }
+          ]
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 1000,
+    "input_tokens_details": { "cached_tokens": 100 },
+    "output_tokens": 200,
+    "output_tokens_details": { "reasoning_tokens": 50 },
+    "total_tokens": 1200,
+    "cost_in_usd_ticks": 12340000,
+    "server_side_tool_usage_details": {
+      "x_search_calls": 2,
+      "x_posts_fetched": 3,
+      "x_users_fetched": 0
+    }
+  }
+}
