@@ -5,7 +5,6 @@
 [![crates.io](https://img.shields.io/crates/v/xavier-cli.svg)](https://crates.io/crates/xavier-cli)
 [![docs.rs](https://img.shields.io/docsrs/xavier-cli)](https://docs.rs/xavier-cli)
 
-Agent-first CLI for searching X posts, written in Rust.
 
 ```console
 $ doppler run -- xavier "what are people saying about Grok 4.7" --limit 5 --from 7d
