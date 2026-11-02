@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use serde::Serialize;
 
+use crate::ledger::LedgerStats;
 use crate::types::{CostSource, Post, SearchResult};
 
 pub fn render_markdown(result: &SearchResult) -> String {
@@ -160,6 +163,74 @@ pub fn render_jsonl(result: &SearchResult) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+pub fn render_stats(stats: &LedgerStats, ledger_path: &Path) -> String {
+    let mut lines = vec![
+        "# Spend stats".to_string(),
+        String::new(),
+        format!("ledger={}", ledger_path.display()),
+        format!("since={}", stats.since.as_deref().unwrap_or("all")),
+        format!(
+            "runs={} cost_usd={} cache_hits={} posts_fetched={} unknown_cost_runs={}",
+            stats.runs,
+            format_cost(stats.cost_usd),
+            stats.cache_hits,
+            stats.posts_fetched,
+            stats.unknown_cost_runs
+        ),
+        String::new(),
+        "## By day".to_string(),
+    ];
+
+    if stats.by_day.is_empty() {
+        lines.push("No entries.".to_string());
+    } else {
+        for day in &stats.by_day {
+            lines.push(format!(
+                "day={} runs={} cost_usd={} cache_hits={} posts_fetched={}",
+                day.day,
+                day.runs,
+                format_cost(day.cost_usd),
+                day.cache_hits,
+                day.posts_fetched
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## By model".to_string());
+    if stats.by_model.is_empty() {
+        lines.push("No entries.".to_string());
+    } else {
+        for model in &stats.by_model {
+            lines.push(format!(
+                "model={} runs={} cost_usd={} cache_hits={} posts_fetched={}",
+                model.model,
+                model.runs,
+                format_cost(model.cost_usd),
+                model.cache_hits,
+                model.posts_fetched
+            ));
+        }
+    }
+
+    format!("{}\n", lines.join("\n"))
+}
+
+pub fn render_stats_json(stats: &LedgerStats) -> String {
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(stats).expect("LedgerStats is serializable")
+    )
+}
+
+fn format_cost(value: f64) -> String {
+    let formatted = format!("{value:.6}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
 fn at_handles(handles: &[String]) -> String {
     handles
         .iter()
@@ -175,7 +246,8 @@ fn one_line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::{Options, OutputFormat};
+    use crate::args::{DEFAULT_BUDGET_WINDOW_SECONDS, LedgerMode, Options, OutputFormat};
+    use crate::ledger::{DayStats, LedgerStats, ModelStats};
     use crate::types::{Effort, SortMode};
     use crate::xai::build_result;
 
@@ -199,6 +271,12 @@ mod tests {
             timeout_ms: 180_000,
             dry_run: false,
             verbose: false,
+            ledger: LedgerMode::On,
+            ledger_dir: None,
+            ledger_query: false,
+            budget_usd: None,
+            budget_window_seconds: DEFAULT_BUDGET_WINDOW_SECONDS,
+            budget_multiplier: crate::cost::DEFAULT_BUDGET_MULTIPLIER,
             cache: crate::args::CacheMode::On,
             cache_ttl_seconds: 900,
             cache_dir: None,
@@ -281,6 +359,73 @@ mod tests {
         assert_eq!(parsed["posts"].as_array().unwrap().len(), 2);
         assert_eq!(parsed["meta"]["usage"]["cost_usd"], 0.001234);
         assert_eq!(parsed["meta"]["usage"]["cost_source"], "api");
+    }
+
+    fn stats_fixture() -> LedgerStats {
+        LedgerStats {
+            since: Some("2026-10-03T12:00:00.000Z".to_string()),
+            runs: 3,
+            cost_usd: 0.0012,
+            cache_hits: 1,
+            posts_fetched: 8,
+            unknown_cost_runs: 0,
+            by_day: vec![DayStats {
+                day: "2026-11-02".to_string(),
+                runs: 3,
+                cost_usd: 0.0012,
+                cache_hits: 1,
+                posts_fetched: 8,
+            }],
+            by_model: vec![ModelStats {
+                model: "grok-4.7".to_string(),
+                runs: 3,
+                cost_usd: 0.0012,
+                cache_hits: 1,
+                posts_fetched: 8,
+            }],
+        }
+    }
+
+    #[test]
+    fn stats_markdown_has_stable_key_value_rows() {
+        let rendered = render_stats(&stats_fixture(), Path::new("/tmp/ledger.jsonl"));
+        assert!(rendered.contains("# Spend stats"));
+        assert!(rendered.contains("ledger=/tmp/ledger.jsonl"));
+        assert!(rendered.contains("since=2026-10-03T12:00:00.000Z"));
+        assert!(rendered.contains("runs=3 cost_usd=0.0012 cache_hits=1 posts_fetched=8"));
+        assert!(rendered.contains("## By day"));
+        assert!(rendered.contains("day=2026-11-02 runs=3 cost_usd=0.0012"));
+        assert!(rendered.contains("## By model"));
+        assert!(rendered.contains("model=grok-4.7 runs=3 cost_usd=0.0012"));
+    }
+
+    #[test]
+    fn stats_markdown_handles_empty_ledgers() {
+        let stats = LedgerStats {
+            since: None,
+            runs: 0,
+            cost_usd: 0.0,
+            cache_hits: 0,
+            posts_fetched: 0,
+            unknown_cost_runs: 0,
+            by_day: Vec::new(),
+            by_model: Vec::new(),
+        };
+        let rendered = render_stats(&stats, Path::new("/tmp/ledger.jsonl"));
+        assert!(rendered.contains("since=all"));
+        assert!(rendered.contains("runs=0 cost_usd=0 cache_hits=0"));
+        assert_eq!(rendered.matches("No entries.").count(), 2);
+    }
+
+    #[test]
+    fn stats_json_sums_runs() {
+        let rendered = render_stats_json(&stats_fixture());
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["runs"], 3);
+        assert_eq!(parsed["cost_usd"], 0.0012);
+        assert_eq!(parsed["cache_hits"], 1);
+        assert_eq!(parsed["by_day"][0]["day"], "2026-11-02");
+        assert_eq!(parsed["by_model"][0]["model"], "grok-4.7");
     }
 
     #[test]

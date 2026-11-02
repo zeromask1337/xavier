@@ -127,6 +127,16 @@ pub fn parse_duration_seconds(input: &str) -> Result<u64> {
     Ok(amount)
 }
 
+/// Render seconds using the largest whole unit, e.g. `30d` or `90m`.
+pub fn format_duration_seconds(seconds: u64) -> String {
+    for (unit, size) in [("w", 604_800), ("d", 86_400), ("h", 3_600), ("m", 60)] {
+        if seconds >= size && seconds.is_multiple_of(size) {
+            return format!("{}{unit}", seconds / size);
+        }
+    }
+    format!("{seconds}s")
+}
+
 /// Add days to a YYYY-MM-DD string, returning a YYYY-MM-DD string.
 pub fn add_days(date: &str, days: i64) -> Result<String> {
     let parsed = parse_date(date)?;
@@ -302,21 +312,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_durations_into_seconds() {
+    fn parses_and_formats_durations() {
+        assert_eq!(parse_duration_seconds("30d").unwrap(), 2_592_000);
+        assert_eq!(parse_duration_seconds("12h").unwrap(), 43_200);
+        assert_eq!(parse_duration_seconds("90m").unwrap(), 5_400);
+        assert_eq!(parse_duration_seconds("45s").unwrap(), 45);
+        assert_eq!(parse_duration_seconds("2w").unwrap(), 1_209_600);
         assert_eq!(parse_duration_seconds("15m").unwrap(), 900);
         assert_eq!(parse_duration_seconds("1h").unwrap(), 3_600);
         assert_eq!(parse_duration_seconds("7d").unwrap(), 604_800);
         assert_eq!(parse_duration_seconds("30s").unwrap(), 30);
-        assert_eq!(parse_duration_seconds("2w").unwrap(), 1_209_600);
         assert_eq!(parse_duration_seconds(" 15M ").unwrap(), 900);
+        assert_eq!(format_duration_seconds(2_592_000), "30d");
+        assert_eq!(format_duration_seconds(5_400), "90m");
+        assert_eq!(format_duration_seconds(3_601), "3601s");
     }
 
     #[test]
     fn rejects_invalid_durations() {
+        assert!(parse_duration_seconds("").is_err());
+        assert!(parse_duration_seconds("30").is_err());
+        assert!(parse_duration_seconds("d").is_err());
+        assert!(parse_duration_seconds("0d").is_err());
         assert!(parse_duration_seconds("0m").is_err());
         assert!(parse_duration_seconds("15").is_err());
         assert!(parse_duration_seconds("fifteen minutes").is_err());
-        assert!(parse_duration_seconds("").is_err());
+        assert!(parse_duration_seconds("1.5h").is_err());
+        assert!(parse_duration_seconds("30y").is_err());
         assert!(parse_duration_seconds("999999999999999999999999999999h").is_err());
     }
 

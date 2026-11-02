@@ -1,8 +1,9 @@
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -20,9 +21,21 @@ struct RequestRecord {
 
 struct TestServer {
     addr: SocketAddr,
+    ledger_dir: PathBuf,
     requests: Arc<Mutex<Vec<RequestRecord>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+}
+
+fn unique_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "xavier-cli-test-{}-{}-{tag}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&path).expect("create test directory");
+    path
 }
 
 impl TestServer {
@@ -69,6 +82,7 @@ impl TestServer {
 
         Self {
             addr,
+            ledger_dir: unique_dir("server"),
             requests,
             stop,
             handle: Some(handle),
@@ -90,6 +104,7 @@ impl Drop for TestServer {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        let _ = fs::remove_dir_all(&self.ledger_dir);
     }
 }
 
@@ -203,9 +218,11 @@ fn command(server: &TestServer) -> Command {
         .env_remove("XAI_API_KEY")
         .env_remove("XAI_BASE_URL")
         .env_remove("XAVIER_MODEL")
+        .env_remove("XAVIER_LEDGER_DIR")
         .env_remove("XAVIER_CACHE_DIR")
         .env("XAI_API_KEY", "test-key")
         .env("XAI_BASE_URL", server.base_url())
+        .env("XAVIER_LEDGER_DIR", &server.ledger_dir)
         .env("XAVIER_CACHE_DIR", isolated_cache)
         .stdin(Stdio::null());
     command
@@ -302,6 +319,18 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+fn ledger_file(server: &TestServer) -> PathBuf {
+    server.ledger_dir.join("ledger.jsonl")
+}
+
+fn read_ledger(server: &TestServer) -> Vec<Value> {
+    let text = fs::read_to_string(ledger_file(server)).unwrap_or_default();
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("ledger line is JSON"))
+        .collect()
 }
 
 #[test]
@@ -453,6 +482,142 @@ fn prints_diagnostics_on_stderr_when_verbose() {
 }
 
 #[test]
+fn records_successful_runs_with_a_private_query_hash() {
+    let server = TestServer::start();
+    let output = run_cli(&server, &["grok 4.7", "--json"], &[]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+
+    let entries = read_ledger(&server);
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry["cost_usd"], 0.001234);
+    assert_eq!(entry["cost_source"], "api");
+    assert_eq!(entry["posts_fetched"], 3);
+    assert_eq!(entry["model"], "grok-4.7");
+    assert_eq!(entry["cached"], false);
+    assert!(entry.get("query").is_none());
+    let hash = entry["query_hash"].as_str().expect("query hash");
+    assert_eq!(hash.len(), 64);
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(!hash.contains("grok"));
+}
+
+#[test]
+fn ledger_query_opts_into_storing_text() {
+    let server = TestServer::start();
+    let output = run_cli(&server, &["grok 4.7", "--ledger-query"], &[]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let entries = read_ledger(&server);
+    assert_eq!(entries[0]["query"], "grok 4.7");
+}
+
+#[test]
+fn ledger_off_writes_nothing() {
+    let server = TestServer::start();
+    let output = run_cli(&server, &["grok 4.7", "--ledger", "off"], &[]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert!(!ledger_file(&server).exists());
+}
+
+#[test]
+fn stats_json_sums_runs_by_day_and_model() {
+    let server = TestServer::start();
+    for _ in 0..2 {
+        let output = run_cli(&server, &["grok 4.7"], &[]);
+        assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    }
+
+    let output = run_cli(&server, &["stats", "--json"], &[("XAI_API_KEY", "")]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let parsed: Value = serde_json::from_str(&stdout(&output)).expect("stats json");
+    assert_eq!(parsed["runs"], 2);
+    assert_eq!(parsed["cost_usd"], 0.002468);
+    assert_eq!(parsed["cache_hits"], 0);
+    assert_eq!(parsed["posts_fetched"], 6);
+    assert_eq!(parsed["by_day"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["by_day"][0]["runs"], 2);
+    assert_eq!(parsed["by_model"][0]["model"], "grok-4.7");
+    assert_eq!(parsed["by_model"][0]["runs"], 2);
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[test]
+fn stats_renders_markdown_and_tolerates_an_empty_ledger() {
+    let server = TestServer::start();
+    let empty = run_cli(&server, &["stats"], &[("XAI_API_KEY", "")]);
+    assert_eq!(empty.status.code(), Some(0), "stderr: {}", stderr(&empty));
+    assert!(stdout(&empty).contains("# Spend stats"));
+    assert!(stdout(&empty).contains("since=all"));
+    assert!(stdout(&empty).contains("runs=0 cost_usd=0"));
+
+    let output = run_cli(&server, &["grok 4.7"], &[]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+
+    let stats = run_cli(&server, &["stats"], &[("XAI_API_KEY", "")]);
+    assert_eq!(stats.status.code(), Some(0), "stderr: {}", stderr(&stats));
+    let text = stdout(&stats);
+    assert!(text.contains("runs=1 cost_usd=0.001234 cache_hits=0 posts_fetched=3"));
+    assert!(text.contains("## By model"));
+    assert!(text.contains("model=grok-4.7 runs=1"));
+}
+
+#[test]
+fn stats_skips_corrupt_lines_and_filters_by_since() {
+    let server = TestServer::start();
+    let ledger = [
+        "not json",
+        r#"{"ts":"2000-01-01T00:00:00.000Z","cost_usd":0.5,"cost_source":"api","posts_fetched":10,"model":"grok-4.6","query_hash":"old","cached":false}"#,
+        r#"{"ts":"2999-01-01T00:00:00.000Z","cost_usd":0.2,"cost_source":"api","posts_fetched":4,"model":"grok-4.7","query_hash":"new","cached":true}"#,
+    ]
+    .join("\n");
+    fs::write(ledger_file(&server), format!("{ledger}\n")).expect("write ledger");
+
+    let output = run_cli(
+        &server,
+        &["stats", "--json", "--since", "30d"],
+        &[("XAI_API_KEY", "")],
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let parsed: Value = serde_json::from_str(&stdout(&output)).expect("stats json");
+    assert_eq!(parsed["runs"], 1);
+    assert_eq!(parsed["cost_usd"], 0.2);
+    assert_eq!(parsed["cache_hits"], 1);
+    assert_eq!(parsed["by_model"][0]["model"], "grok-4.7");
+}
+
+#[test]
+fn budget_refusal_makes_no_request() {
+    let server = TestServer::start();
+    let first = run_cli(&server, &["grok 4.7", "--budget-usd", "0.3"], &[]);
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", stderr(&first));
+    assert_eq!(server.requests().len(), 1);
+
+    let second = run_cli(&server, &["grok 4.7", "--budget-usd", "0.3"], &[]);
+    assert_eq!(second.status.code(), Some(4), "stderr: {}", stderr(&second));
+    assert!(stderr(&second).contains("budget exceeded"));
+    assert_eq!(server.requests().len(), 1);
+    assert_eq!(read_ledger(&server).len(), 1);
+}
+
+#[test]
+fn warns_after_a_run_that_exceeds_the_budget() {
+    let server = TestServer::start();
+    let output = run_cli(
+        &server,
+        &[
+            "grok 4.7",
+            "--budget-usd",
+            "0.001",
+            "--budget-multiplier",
+            "0.001",
+        ],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains("budget exceeded after this run"));
+}
+
+#[test]
 fn second_run_hits_cache_without_an_api_key() {
     let server = TestServer::start();
     let cache = TempDir::new("hit");
@@ -486,6 +651,29 @@ fn second_run_hits_cache_without_an_api_key() {
     );
     assert!(stdout(&markdown).contains("cache=hit"));
     assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn cache_hits_are_recorded_in_the_ledger_as_free() {
+    let server = TestServer::start();
+    let cache = TempDir::new("ledger-hit");
+
+    let first = run_cli_with_cache(&server, cache.path(), &["grok 4.7"], &[]);
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", stderr(&first));
+    let first_entries = read_ledger(&server);
+    assert_eq!(first_entries.len(), 1);
+    assert_eq!(first_entries[0]["cached"], false);
+    assert_eq!(first_entries[0]["cost_usd"], 0.001234);
+
+    let second = run_cli_with_cache(&server, cache.path(), &["grok 4.7"], &[("XAI_API_KEY", "")]);
+    assert_eq!(second.status.code(), Some(0), "stderr: {}", stderr(&second));
+    assert_eq!(server.requests().len(), 1);
+
+    let entries = read_ledger(&server);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1]["cached"], true);
+    assert_eq!(entries[1]["cost_usd"], 0.0);
+    assert_eq!(entries[0]["query_hash"], entries[1]["query_hash"]);
 }
 
 #[test]
