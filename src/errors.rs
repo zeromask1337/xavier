@@ -10,6 +10,11 @@ pub enum AppError {
         message: String,
         hint: Option<String>,
     },
+    /// The spend budget would be exceeded. Exit code 4.
+    Budget {
+        message: String,
+        hint: Option<String>,
+    },
 }
 
 impl AppError {
@@ -31,24 +36,33 @@ impl AppError {
         }
     }
 
+    pub fn budget(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self::Budget {
+            message: message.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Usage(_) => 2,
             Self::Runtime { .. } => 1,
+            Self::Budget { .. } => 4,
         }
     }
 
     pub fn message(&self) -> &str {
         match self {
-            Self::Usage(message) => message,
-            Self::Runtime { message, .. } => message,
+            Self::Usage(message) | Self::Runtime { message, .. } | Self::Budget { message, .. } => {
+                message
+            }
         }
     }
 
     pub fn hint(&self) -> Option<&str> {
         match self {
             Self::Usage(_) => None,
-            Self::Runtime { hint, .. } => hint.as_deref(),
+            Self::Runtime { hint, .. } | Self::Budget { hint, .. } => hint.as_deref(),
         }
     }
 

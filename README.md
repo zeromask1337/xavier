@@ -167,6 +167,54 @@ converted to the exclusive `to_date` that xAI expects.
 }
 ```
 
+### Spend ledger and budget
+
+Every successful run appends one line to an append-only JSONL ledger:
+
+```json
+{"ts":"2026-11-02T12:00:00.000Z","cost_usd":0.001234,"cost_source":"api","posts_fetched":3,"model":"grok-4.7","query_hash":"...","cached":false}
+```
+
+The default location is the platform data directory:
+
+| Platform | Path |
+| --- | --- |
+| Linux | `$XDG_DATA_HOME/xavier/ledger.jsonl`, or `~/.local/share/xavier/ledger.jsonl` |
+| macOS | `~/Library/Application Support/xavier/ledger.jsonl` |
+| Windows | `%LOCALAPPDATA%\xavier\ledger.jsonl` |
+
+`--ledger-dir <path>` and `XAVIER_LEDGER_DIR` override the directory. The flag wins
+over the environment variable. On Unix the ledger file is created with `0600`
+permissions.
+
+Only a SHA-256 hash of the whitespace-normalized query is stored by default. Pass
+`--ledger-query` if you need the query text in the ledger.
+
+```sh
+xavier stats                 # all-time totals
+xavier stats --since 7d      # last 7 days
+xavier stats --json          # machine-readable totals
+```
+
+`stats` reports run count, total cost, cache hits, fetched posts, and totals by day
+and model. Corrupt or partial ledger lines are skipped. Cache hits are recorded with
+`cost_usd = 0` and `cached = true`.
+
+| Flag | Description |
+| --- | --- |
+| `--ledger <on\|off>` | Record successful runs. Default `on`. |
+| `--ledger-dir <path>` | Ledger directory. |
+| `--ledger-query` | Store query text. Off by default. |
+| `--budget-usd <amount>` | Refuse to start when window spend plus the soft estimate would exceed this amount. |
+| `--budget-window <duration>` | Budget window: `30d`, `12h`, `2w`. Default `30d`. |
+| `--budget-multiplier <n>` | Preflight estimate multiplier. Default `3`. |
+
+The preflight estimate is deliberately soft: `x_posts_fetched` can exceed `--limit`, so
+it prices `--limit * --budget-multiplier` posts at $0.005 each. The check runs before
+the request and refuses with exit code 4. After a response, the ledger is updated and
+the hard check warns if the window now exceeds the budget; further runs are refused.
+A budget cannot undo spend from the request that already completed.
+
 ### Other flags
 
 | Flag | Description |
@@ -187,3 +235,4 @@ converted to the exclusive `to_date` that xAI expects.
 | 0 | Success, including zero matches. |
 | 1 | API, network, or response error. |
 | 2 | Usage or configuration error (bad flag, missing key). |
+| 4 | Budget refusal: the window spend plus the preflight estimate exceeds `--budget-usd`. |

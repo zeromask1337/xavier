@@ -36,6 +36,31 @@ pub struct RawResponse {
     pub elapsed_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawSummary {
+    pub model: String,
+    pub cost_usd: Option<f64>,
+    pub cost_source: Option<CostSource>,
+    pub posts_fetched: i64,
+}
+
+/// Extract the fields the ledger needs from a raw payload, including payloads
+/// that `build_result` would reject.
+pub fn summarize_raw(data: &Value, fallback_model: &str) -> RawSummary {
+    let empty = Map::new();
+    let root = data.as_object().unwrap_or(&empty);
+    let mut warnings = Vec::new();
+    let usage = extract_usage(root, fallback_model, &mut warnings);
+    RawSummary {
+        model: as_string(root.get("model"))
+            .unwrap_or(fallback_model)
+            .to_string(),
+        cost_usd: usage.cost_usd,
+        cost_source: usage.cost_source,
+        posts_fetched: usage.x_posts_fetched,
+    }
+}
+
 pub fn build_request_body(options: &Options) -> Value {
     let mut tool = Map::new();
     tool.insert("type".to_string(), json!("x_search"));
@@ -847,7 +872,7 @@ fn unix_to_iso(seconds: Option<f64>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::OutputFormat;
+    use crate::args::{DEFAULT_BUDGET_WINDOW_SECONDS, LedgerMode, OutputFormat};
     use crate::types::{Effort, SortMode};
     use serde_json::json;
 
@@ -871,6 +896,12 @@ mod tests {
             timeout_ms: 180_000,
             dry_run: false,
             verbose: false,
+            ledger: LedgerMode::On,
+            ledger_dir: None,
+            ledger_query: false,
+            budget_usd: None,
+            budget_window_seconds: DEFAULT_BUDGET_WINDOW_SECONDS,
+            budget_multiplier: crate::cost::DEFAULT_BUDGET_MULTIPLIER,
         }
     }
 
@@ -1016,6 +1047,20 @@ mod tests {
         assert_eq!(result.meta.usage.x_posts_fetched, 3);
         assert_eq!(result.meta.usage.x_search_calls, 2);
         assert_eq!(result.meta.usage.cached_input_tokens, 100);
+    }
+
+    #[test]
+    fn summarizes_raw_payloads_for_the_ledger() {
+        let summary = summarize_raw(&fixture(), "grok-4.6");
+        assert_eq!(summary.model, "grok-4.7");
+        assert_eq!(summary.cost_usd, Some(0.001234));
+        assert_eq!(summary.cost_source, Some(CostSource::Api));
+        assert_eq!(summary.posts_fetched, 3);
+
+        let fallback = summarize_raw(&json!({}), "mystery-model");
+        assert_eq!(fallback.model, "mystery-model");
+        assert_eq!(fallback.cost_usd, None);
+        assert_eq!(fallback.posts_fetched, 0);
     }
 
     #[test]

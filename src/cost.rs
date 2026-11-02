@@ -14,6 +14,14 @@ const PRICES: &[(&str, f64, f64, f64)] = &[
 const X_POST_USD: f64 = 0.005;
 const X_USER_USD: f64 = 0.01;
 
+pub const DEFAULT_BUDGET_MULTIPLIER: f64 = 3.0;
+
+/// Soft preflight estimate for one run. `x_posts_fetched` can exceed `--limit`,
+/// so the multiplier pads the limit before applying the per-post price.
+pub fn estimate_run_cost(limit: usize, multiplier: f64) -> f64 {
+    round_usd(limit as f64 * multiplier.max(0.0) * X_POST_USD)
+}
+
 pub struct CostInput<'a> {
     pub model: &'a str,
     pub input: i64,
@@ -96,6 +104,13 @@ mod tests {
     #[test]
     fn rounds_to_six_decimals() {
         assert_eq!(round_usd(0.123456789), 0.123457);
+    }
+
+    #[test]
+    fn estimates_budget_spend_from_the_limit() {
+        assert_eq!(estimate_run_cost(20, 3.0), 0.3);
+        assert_eq!(estimate_run_cost(5, 3.0), 0.075);
+        assert_eq!(estimate_run_cost(5, 0.0), 0.0);
     }
 
     #[test]
