@@ -108,6 +108,7 @@ pub fn render_jsonl(result: &SearchResult) -> String {
     struct ResultLine<'a> {
         #[serde(rename = "type")]
         kind: &'static str,
+        schema_version: u32,
         query: &'a str,
         summary: &'a str,
         meta: &'a crate::types::Meta,
@@ -140,6 +141,7 @@ pub fn render_jsonl(result: &SearchResult) -> String {
     let mut lines = vec![
         serde_json::to_string(&ResultLine {
             kind: "result",
+            schema_version: result.schema_version,
             query: &result.query,
             summary: &result.summary,
             meta: &result.meta,
@@ -192,6 +194,7 @@ mod tests {
             timeout_ms: 180_000,
             dry_run: false,
             verbose: false,
+            json_errors: false,
         }
     }
 
@@ -240,6 +243,7 @@ mod tests {
     fn json_round_trips_the_result_object() {
         let rendered = render_json(&result());
         let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
         assert_eq!(parsed["query"], "grok 4.7");
         assert_eq!(parsed["posts"].as_array().unwrap().len(), 2);
         assert_eq!(parsed["meta"]["usage"]["cost_usd"], 0.001234);
@@ -254,6 +258,7 @@ mod tests {
 
         let head: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(head["type"], "result");
+        assert_eq!(head["schema_version"], 1);
         assert!(head.get("posts").is_none());
         assert_eq!(head["summary"], "Mixed reactions.");
 

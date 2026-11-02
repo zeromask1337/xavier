@@ -7,8 +7,8 @@ use serde_json::{Map, Value, json};
 use crate::args::{Options, to_exclusive_date};
 use crate::cost::{CostInput, estimate_cost, round_usd};
 use crate::dates::is_valid_date_string;
-use crate::errors::{AppError, Result};
-use crate::types::{CostSource, Meta, Post, SearchCall, SearchResult, Usage};
+use crate::errors::{AppError, ErrorCode, Result};
+use crate::types::{CostSource, Meta, Post, SCHEMA_VERSION, SearchCall, SearchResult, Usage};
 
 pub const API_BASE: &str = "https://api.x.ai/v1";
 const TICKS_PER_USD: f64 = 10_000_000_000.0;
@@ -236,15 +236,17 @@ pub fn request_x_posts(
                 || message.to_ascii_lowercase().contains("timeout");
             if timed_out {
                 let seconds = (options.timeout_ms as f64 / 1000.0).round() as u64;
-                return Err(AppError::runtime_with_hint(
+                return Err(AppError::new(
+                    ErrorCode::Timeout,
                     format!("Request timed out after {seconds}s."),
-                    "Raise --timeout or narrow the search.",
-                ));
+                )
+                .with_hint("Raise --timeout or narrow the search."));
             }
-            return Err(AppError::runtime_with_hint(
+            return Err(AppError::new(
+                ErrorCode::Network,
                 format!("Could not reach xAI: {message}"),
-                format!("Check network access to {base_url}."),
-            ));
+            )
+            .with_hint(format!("Check network access to {base_url}.")));
         }
     };
 
@@ -254,11 +256,16 @@ pub fn request_x_posts(
             if !(200..300).contains(&status) {
                 return Err(api_error(status, None, &text));
             }
+            let error = AppError::new(
+                ErrorCode::InvalidResponse,
+                format!("xAI returned non-JSON (HTTP {status})."),
+            )
+            .with_http_status(status);
             let hint = truncate(text.trim(), 300);
-            let error = AppError::runtime(format!("xAI returned non-JSON (HTTP {status})."));
-            return Err(match hint {
-                hint if !hint.is_empty() => AppError::runtime_with_hint(error.message(), hint),
-                _ => error,
+            return Err(if hint.is_empty() {
+                error
+            } else {
+                error.with_hint(hint)
             });
         }
     };
@@ -294,16 +301,15 @@ pub fn build_result(data: &Value, options: &Options, elapsed_ms: u64) -> Result<
                 .and_then(Value::as_object)
                 .and_then(|details| as_string(details.get("reason")))
                 .unwrap_or("unknown reason");
-            return Err(AppError::runtime_with_hint(
+            return Err(AppError::new(
+                ErrorCode::Incomplete,
                 format!("xAI response was incomplete: {reason}."),
-                "Raise --max-turns, narrow the query, or retry.",
-            ));
+            )
+            .with_hint("Raise --max-turns, narrow the query, or retry."));
         }
         Some("failed") => {
-            return Err(AppError::runtime_with_hint(
-                "xAI response failed.",
-                "Retry, or use --raw to inspect the payload.",
-            ));
+            return Err(AppError::new(ErrorCode::Server, "xAI response failed.")
+                .with_hint("Retry, or use --raw to inspect the payload."));
         }
         _ => {}
     }
@@ -376,11 +382,14 @@ pub fn build_result(data: &Value, options: &Options, elapsed_ms: u64) -> Result<
             "placeholder" | "todo" | "tbd" | "na" | "n/a"
         );
     if posts.is_empty() && is_stub && usage.x_posts_fetched > 0 {
-        return Err(AppError::runtime_with_hint(
+        return Err(AppError::new(
+            ErrorCode::Placeholder,
             format!(
                 "xAI returned a placeholder result after fetching {} posts.",
                 usage.x_posts_fetched
             ),
+        )
+        .with_hint(
             "This usually means --max-turns was exhausted. Retry with a higher --max-turns or a narrower query.",
         ));
     }
@@ -414,6 +423,7 @@ pub fn build_result(data: &Value, options: &Options, elapsed_ms: u64) -> Result<
     };
 
     Ok(SearchResult {
+        schema_version: SCHEMA_VERSION,
         query: options.query.clone(),
         summary,
         posts,
@@ -757,10 +767,14 @@ fn api_error(status: u16, data: Option<&Value>, text: &str) -> AppError {
         _ => None,
     };
 
-    let message = format!("xAI API error {status}: {message}");
+    let error = AppError::new(
+        ErrorCode::from_http_status(status),
+        format!("xAI API error {status}: {message}"),
+    )
+    .with_http_status(status);
     match hint {
-        Some(hint) => AppError::runtime_with_hint(message, hint),
-        None => AppError::runtime(message),
+        Some(hint) => error.with_hint(hint),
+        None => error,
     }
 }
 
@@ -871,6 +885,7 @@ mod tests {
             timeout_ms: 180_000,
             dry_run: false,
             verbose: false,
+            json_errors: false,
         }
     }
 
@@ -1076,13 +1091,16 @@ mod tests {
     fn rejects_responses_without_a_final_message() {
         let error = build_result(&json!({ "output": [] }), &options(), 0).unwrap_err();
         assert!(error.message().contains("no final message"));
+        assert_eq!(error.code(), ErrorCode::InvalidResponse);
+        assert!(!error.retryable());
     }
 
     #[test]
     fn rejects_unparseable_structured_output() {
         let mut data = fixture();
         data["output"][2]["content"][0]["text"] = json!("not json");
-        assert!(build_result(&data, &options(), 0).is_err());
+        let error = build_result(&data, &options(), 0).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidResponse);
     }
 
     #[test]
@@ -1091,6 +1109,8 @@ mod tests {
         data["output"][2]["content"][0]["text"] = json!(r#"{"summary":"placeholder","posts":[]}"#);
         let error = build_result(&data, &options(), 0).unwrap_err();
         assert!(error.message().contains("placeholder result"));
+        assert_eq!(error.code(), ErrorCode::Placeholder);
+        assert!(error.retryable());
     }
 
     #[test]
@@ -1101,6 +1121,69 @@ mod tests {
         data["output"] = json!([]);
         let error = build_result(&data, &options(), 0).unwrap_err();
         assert!(error.message().contains("incomplete"));
+        assert_eq!(error.code(), ErrorCode::Incomplete);
+        assert!(error.retryable());
+    }
+
+    #[test]
+    fn maps_failed_responses_to_the_server_code() {
+        let mut data = fixture();
+        data["status"] = json!("failed");
+        let error = build_result(&data, &options(), 0).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Server);
+        assert!(error.retryable());
+    }
+
+    #[test]
+    fn maps_http_statuses_to_stable_codes_and_hints() {
+        let data = json!({ "error": { "message": "nope" } });
+        let expected = [
+            (401, ErrorCode::Auth),
+            (403, ErrorCode::Forbidden),
+            (404, ErrorCode::NotFound),
+            (429, ErrorCode::RateLimited),
+            (400, ErrorCode::InvalidResponse),
+            (500, ErrorCode::Server),
+            (503, ErrorCode::Server),
+        ];
+
+        for (status, code) in expected {
+            let error = api_error(status, Some(&data), "");
+            assert_eq!(error.code(), code, "HTTP {status}");
+            assert_eq!(error.http_status(), Some(status));
+            assert_eq!(error.retryable(), code.retryable(), "HTTP {status}");
+            assert!(error.message().contains("nope"));
+            assert!(error.message().contains(&status.to_string()));
+        }
+
+        assert!(
+            api_error(401, Some(&data), "")
+                .hint()
+                .unwrap()
+                .contains("XAI_API_KEY")
+        );
+        assert!(
+            api_error(429, Some(&data), "")
+                .hint()
+                .unwrap()
+                .contains("retry")
+        );
+        assert!(
+            api_error(503, Some(&data), "")
+                .hint()
+                .unwrap()
+                .contains("retry")
+        );
+        assert!(api_error(400, Some(&data), "").hint().is_none());
+    }
+
+    #[test]
+    fn keeps_non_json_error_bodies_in_the_message() {
+        let error = api_error(502, None, "upstream unavailable");
+        assert_eq!(error.code(), ErrorCode::Server);
+        assert!(error.message().contains("upstream unavailable"));
+        assert!(error.hint().unwrap().contains("retry"));
+        assert_eq!(error.http_status(), Some(502));
     }
 
     #[test]

@@ -4,19 +4,25 @@ use std::io::{self, IsTerminal, Read};
 use chrono::Utc;
 
 use crate::args::{ParsedCli, help_text, parse_cli};
+use crate::capabilities;
 use crate::cost::format_usd;
-use crate::errors::AppError;
+use crate::errors::{AppError, ErrorCode};
 use crate::output::{render_json, render_jsonl, render_markdown};
 use crate::xai::{build_request_body, build_result, request_x_posts};
 
 pub fn run(argv: Vec<String>) -> i32 {
+    let json_errors = json_errors_requested(&argv);
     let env: HashMap<String, String> = std::env::vars().collect();
     let now = Utc::now();
 
     let parsed = match parse_cli(&argv, &env, now) {
         Ok(parsed) => parsed,
         Err(error) => {
-            eprint!("xavier: {}\n\n{}", error.message(), help_text());
+            if json_errors {
+                report(&error, true);
+            } else {
+                eprint!("xavier: {}\n\n{}", error.message(), help_text());
+            }
             return error.exit_code();
         }
     };
@@ -30,8 +36,17 @@ pub fn run(argv: Vec<String>) -> i32 {
             println!("xavier {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
+        ParsedCli::Capabilities => {
+            print!("{}", capabilities::render_manifest());
+            return 0;
+        }
+        ParsedCli::SchemaOutput => {
+            print!("{}", capabilities::render_output_schema());
+            return 0;
+        }
         ParsedCli::Run(options) => options,
     };
+    let json_errors = options.json_errors;
 
     let mut query = options.query.clone();
     if query == "-" || (query.is_empty() && !io::stdin().is_terminal()) {
@@ -43,10 +58,10 @@ pub fn run(argv: Vec<String>) -> i32 {
 
     query = query.split_whitespace().collect::<Vec<_>>().join(" ");
     if query.is_empty() {
-        eprint!(
-            "xavier: missing query.\n\nUsage: xavier [search] <query> [options]\n       echo \"<query>\" | xavier -\n"
-        );
-        return 2;
+        let error = AppError::new(ErrorCode::Empty, "missing query.")
+            .with_hint("Usage: xavier [search] <query> [options] or echo \"<query>\" | xavier -");
+        report(&error, json_errors);
+        return error.exit_code();
     }
     options.query = query;
 
@@ -61,17 +76,16 @@ pub fn run(argv: Vec<String>) -> i32 {
 
     let api_key = env.get("XAI_API_KEY").map(|value| value.trim().to_string());
     let Some(api_key) = api_key.filter(|value| !value.is_empty()) else {
-        eprint!(
-            "xavier: XAI_API_KEY is not set.\n  Run with: doppler run -- xavier \"your query\"\n  Or: export XAI_API_KEY=...\n"
-        );
-        return 2;
+        let error = AppError::missing_api_key();
+        report(&error, json_errors);
+        return error.exit_code();
     };
 
     let base_url = env.get("XAI_BASE_URL").map(String::as_str);
     let raw = match request_x_posts(&options, &api_key, base_url) {
         Ok(raw) => raw,
         Err(error) => {
-            report(&error);
+            report(&error, json_errors);
             return error.exit_code();
         }
     };
@@ -90,7 +104,7 @@ pub fn run(argv: Vec<String>) -> i32 {
     let result = match build_result(&raw.raw, &options, raw.elapsed_ms) {
         Ok(result) => result,
         Err(error) => {
-            report(&error);
+            report(&error, json_errors);
             return error.exit_code();
         }
     };
@@ -135,11 +149,21 @@ pub fn run(argv: Vec<String>) -> i32 {
     0
 }
 
-fn report(error: &AppError) {
+fn report(error: &AppError, json_errors: bool) {
+    if json_errors {
+        eprintln!("{}", error.to_json_string());
+        return;
+    }
     eprintln!("xavier: {}", error.message());
     if let Some(hint) = error.hint() {
         eprintln!("  hint: {hint}");
     }
+}
+
+fn json_errors_requested(argv: &[String]) -> bool {
+    argv.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--json-errors" || arg.starts_with("--json-errors="))
 }
 
 fn read_stdin() -> String {

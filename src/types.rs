@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+/// Version of the machine-readable output contract.
+pub const SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    SCHEMA_VERSION
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Post {
     /// Canonical x.com URL.
@@ -116,6 +123,8 @@ pub struct Meta {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchResult {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub query: String,
     pub summary: String,
     pub posts: Vec<Post>,
