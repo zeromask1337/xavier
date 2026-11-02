@@ -64,6 +64,7 @@ pub struct Options {
     pub timeout_ms: u64,
     pub dry_run: bool,
     pub verbose: bool,
+    pub json_errors: bool,
     pub ledger: LedgerMode,
     pub ledger_dir: Option<String>,
     pub ledger_query: bool,
@@ -88,6 +89,8 @@ pub struct StatsOptions {
 pub enum ParsedCli {
     Help,
     Version,
+    Capabilities,
+    SchemaOutput,
     Run(Box<Options>),
     Stats(StatsOptions),
 }
@@ -116,6 +119,7 @@ struct RawValues {
     timeout: Option<String>,
     dry_run: bool,
     verbose: bool,
+    json_errors: bool,
     ledger: Option<String>,
     ledger_dir: Option<String>,
     ledger_query: bool,
@@ -173,6 +177,7 @@ pub fn parse_cli(
                 "videos" => set_bool(&mut values.videos, attached, "--videos")?,
                 "dry-run" => set_bool(&mut values.dry_run, attached, "--dry-run")?,
                 "verbose" => set_bool(&mut values.verbose, attached, "--verbose")?,
+                "json-errors" => set_bool(&mut values.json_errors, attached, "--json-errors")?,
                 "ledger-query" => set_bool(&mut values.ledger_query, attached, "--ledger-query")?,
                 "ledger" => {
                     values.ledger = Some(take_value(
@@ -385,6 +390,20 @@ pub fn parse_cli(
     match args.first().map(String::as_str) {
         Some("help") => return Ok(ParsedCli::Help),
         Some("version") => return Ok(ParsedCli::Version),
+        Some("capabilities") => {
+            if args.len() > 1 {
+                return Err(AppError::usage(
+                    "The capabilities command takes no arguments.",
+                ));
+            }
+            return Ok(ParsedCli::Capabilities);
+        }
+        Some("schema") => {
+            return match args.get(1).map(String::as_str) {
+                Some("output") if args.len() == 2 => Ok(ParsedCli::SchemaOutput),
+                _ => Err(AppError::usage("Usage: xavier schema output")),
+            };
+        }
         Some("search" | "s") => {
             args.remove(0);
         }
@@ -547,6 +566,7 @@ pub fn parse_cli(
         timeout_ms: timeout_seconds as u64 * 1000,
         dry_run: values.dry_run,
         verbose: values.verbose,
+        json_errors: values.json_errors,
         ledger,
         ledger_dir,
         ledger_query: values.ledger_query,
@@ -844,6 +864,8 @@ pub fn help_text() -> String {
 USAGE
   xavier [search] <query> [options]
   echo "<query>" | xavier -
+  xavier capabilities [--json]
+  xavier schema output
   xavier stats [--since 30d] [--json]
   xavier --help
   xavier --version
@@ -891,7 +913,12 @@ LEDGER
 OTHER
       --model <id>               xAI model (default {DEFAULT_MODEL})
       --timeout <seconds>        Request timeout (5-600, default {DEFAULT_TIMEOUT_SECONDS})
+      --json-errors              One JSON error object on stderr
   -v, --verbose                  Diagnostics on stderr
+
+INTROSPECTION
+  xavier capabilities [--json]   Commands, flags, defaults, limits, formats, env
+  xavier schema output           JSON Schema for the SearchResult object
 
 AUTH
   XAI_API_KEY, for example:
@@ -990,6 +1017,36 @@ mod tests {
             parse_cli(&args("version"), &env(&[]), now()).unwrap(),
             ParsedCli::Version
         );
+    }
+
+    #[test]
+    fn parses_introspection_commands() {
+        let parse = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+            parse_cli(&argv, &env(&[]), now())
+        };
+
+        assert_eq!(parse(&["capabilities"]).unwrap(), ParsedCli::Capabilities);
+        assert_eq!(
+            parse(&["capabilities", "--json"]).unwrap(),
+            ParsedCli::Capabilities
+        );
+        assert_eq!(
+            parse(&["schema", "output"]).unwrap(),
+            ParsedCli::SchemaOutput
+        );
+        assert!(parse(&["schema", "output", "--json"]).is_ok());
+
+        assert!(error(&["capabilities", "extra"]).is_usage());
+        assert!(error(&["schema"]).is_usage());
+        assert!(error(&["schema", "input"]).is_usage());
+        assert!(error(&["schema", "output", "extra"]).is_usage());
+    }
+
+    #[test]
+    fn captures_the_json_errors_flag() {
+        assert!(run(&["grok", "--json-errors"]).json_errors);
+        assert!(!run(&["grok"]).json_errors);
     }
 
     #[test]

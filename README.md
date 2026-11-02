@@ -29,7 +29,8 @@ condescending, or not ready for enterprise production.
 ```
 
 Default output is compact Markdown with stable headings and a `key=value` metadata line.
-`--json` and `--jsonl` are available for machine consumption.
+`--json` and `--jsonl` are available for machine consumption. JSON and JSONL output
+carry `schema_version: 1`, and `--json-errors` gives agents stable, retry-aware errors.
 
 ## Install
 
@@ -119,6 +120,7 @@ converted to the exclusive `to_date` that xAI expects.
 
 ```json
 {
+  "schema_version": 1,
   "query": "Grok 4.7 benchmark reactions",
   "summary": "Mixed reactions...",
   "posts": [
@@ -249,6 +251,7 @@ not touch the cache. Replay does not require a key and never makes a request.
 | --- | --- |
 | `--model <id>` | xAI model. Default `grok-4.7`. `XAVIER_MODEL` also works. |
 | `--timeout <seconds>` | Request timeout, 5–600. Default 180. |
+| `--json-errors` | On failure, write one JSON error object to stderr; stdout stays empty. |
 | `-v, --verbose` | Search queries, response id, cost, and timing on stderr. |
 | `-h, --help` | Usage. |
 | `-V, --version` | Version. |
@@ -256,13 +259,57 @@ not touch the cache. Replay does not require a key and never makes a request.
 `XAI_BASE_URL` overrides the API base, including `/v1` (default
 `https://api.x.ai/v1`).
 
+### Introspection
+
+```sh
+xavier capabilities --json
+xavier schema output
+```
+
+`capabilities` returns the name, version, `schema_version`, commands, flags, defaults,
+limits, output formats, environment variables, exit codes, and every stable error code
+with its retry policy. `schema output` returns a JSON Schema for the `--json`
+`SearchResult` object.
+
+### Errors
+
+Failures use stable codes. With `--json-errors`, exactly one JSON object is written to
+stderr and stdout stays empty:
+
+```json
+{"error":{"code":"rate_limited","message":"xAI API error 429: slow down","hint":"Rate limited; wait and retry.","retryable":true,"http_status":429}}
+```
+
+`hint` and `http_status` are omitted when they do not apply.
+
+| Code | Exit | Retryable | Meaning |
+| --- | --- | --- | --- |
+| `usage` | 2 | no | Bad flag, conflicting option, or invalid value. |
+| `missing_api_key` | 2 | no | `XAI_API_KEY` is missing or empty. |
+| `auth` | 1 | no | The API rejected the key (HTTP 401). |
+| `forbidden` | 1 | no | The key lacks access to the model or X Search (HTTP 403). |
+| `not_found` | 1 | no | The model or endpoint does not exist (HTTP 404). |
+| `rate_limited` | 1 | yes | The API rate limited the request (HTTP 429). |
+| `server` | 1 | yes | The API failed internally (HTTP 5xx or a failed response). |
+| `timeout` | 1 | yes | The request exceeded `--timeout`. |
+| `network` | 1 | yes | xAI could not be reached. |
+| `invalid_response` | 1 | no | The response was malformed or unparseable. |
+| `incomplete` | 1 | yes | The model stopped before finishing; raise `--max-turns` or retry. |
+| `placeholder` | 1 | yes | The model returned a placeholder instead of results. |
+| `budget_exceeded` | 4 | no | The window spend plus the preflight estimate would exceed `--budget-usd`. |
+| `empty` | 2 | no | No query was provided. |
+
+Retry only when `retryable` is `true`, and back off between attempts. For `auth`,
+`forbidden`, `usage`, and `missing_api_key`, fix the request or configuration instead.
+Use `hint` for the suggested remediation.
+
 ### Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | 0 | Success, including zero matches. |
 | 1 | API, network, or response error. |
-| 2 | Usage or configuration error (bad flag, missing key). |
+| 2 | Usage or configuration error (bad flag, missing key, empty query). |
 | 4 | Budget refusal: the window spend plus the preflight estimate exceeds `--budget-usd`. |
 
 ## Architecture
@@ -275,3 +322,4 @@ not touch the cache. Replay does not require a key and never makes a request.
 - `src/args.rs` — flags, `CacheMode`, `LedgerMode`, `stats` parsing, option validation.
 - `src/dates.rs` — date and duration parsing.
 - `src/cost.rs`, `src/errors.rs`, `src/types.rs` — cost estimates, errors, shared types.
+- `src/capabilities.rs` — stable error catalog, exit codes, and output schema for agents.

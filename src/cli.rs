@@ -8,9 +8,10 @@ use crate::args::{
     CacheMode, LedgerMode, Options, OutputFormat, ParsedCli, StatsOptions, help_text, parse_cli,
 };
 use crate::cache::{CacheEntry, CacheStore, LoadedCache, ReplaySource, cache_key, read_replay};
+use crate::capabilities;
 use crate::cost::{estimate_run_cost, format_usd, round_usd};
 use crate::dates::format_duration_seconds;
-use crate::errors::AppError;
+use crate::errors::{AppError, ErrorCode};
 use crate::ledger::{self, LedgerEntry, RunRecord};
 use crate::output::{render_json, render_jsonl, render_markdown, render_stats, render_stats_json};
 use crate::types::{CacheMeta, SearchResult};
@@ -19,13 +20,18 @@ use crate::xai::{
 };
 
 pub fn run(argv: Vec<String>) -> i32 {
+    let json_errors = json_errors_requested(&argv);
     let env: HashMap<String, String> = std::env::vars().collect();
     let now = Utc::now();
 
     let parsed = match parse_cli(&argv, &env, now) {
         Ok(parsed) => parsed,
         Err(error) => {
-            eprint!("xavier: {}\n\n{}", error.message(), help_text());
+            if json_errors {
+                report(&error, true);
+            } else {
+                eprint!("xavier: {}\n\n{}", error.message(), help_text());
+            }
             return error.exit_code();
         }
     };
@@ -39,14 +45,23 @@ pub fn run(argv: Vec<String>) -> i32 {
             println!("xavier {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
-        ParsedCli::Stats(options) => return run_stats(options, &env, now),
+        ParsedCli::Capabilities => {
+            print!("{}", capabilities::render_manifest());
+            return 0;
+        }
+        ParsedCli::SchemaOutput => {
+            print!("{}", capabilities::render_output_schema());
+            return 0;
+        }
+        ParsedCli::Stats(options) => return run_stats(options, &env, now, json_errors),
         ParsedCli::Run(options) => *options,
     };
+    let json_errors = options.json_errors;
 
     let base_url = resolve_base_url(env.get("XAI_BASE_URL").map(String::as_str));
 
     if let Some(path) = options.replay.clone() {
-        return run_replay(&path, &options);
+        return run_replay(&path, &options, json_errors);
     }
 
     let mut query = options.query.clone();
@@ -59,10 +74,10 @@ pub fn run(argv: Vec<String>) -> i32 {
 
     query = query.split_whitespace().collect::<Vec<_>>().join(" ");
     if query.is_empty() {
-        eprint!(
-            "xavier: missing query.\n\nUsage: xavier [search] <query> [options]\n       echo \"<query>\" | xavier -\n"
-        );
-        return 2;
+        let error = AppError::new(ErrorCode::Empty, "missing query.")
+            .with_hint("Usage: xavier [search] <query> [options] or echo \"<query>\" | xavier -");
+        report(&error, json_errors);
+        return error.exit_code();
     }
     options.query = query;
 
@@ -79,7 +94,7 @@ pub fn run(argv: Vec<String>) -> i32 {
         match ledger::resolve_path(options.ledger_dir.as_deref(), &env) {
             Ok(path) => Some(path),
             Err(error) => {
-                report(&error);
+                report(&error, json_errors);
                 return error.exit_code();
             }
         }
@@ -105,7 +120,7 @@ pub fn run(argv: Vec<String>) -> i32 {
                     format!("Could not read ledger {}: {error}", path.display()),
                     "Check --ledger-dir permissions or disable the ledger with --ledger off.",
                 );
-                report(&error);
+                report(&error, json_errors);
                 return error.exit_code();
             }
         };
@@ -128,23 +143,22 @@ pub fn run(argv: Vec<String>) -> i32 {
                 ),
                 "Raise --budget-usd or inspect spend with `xavier stats`.",
             );
-            report(&error);
+            report(&error, json_errors);
             return error.exit_code();
         }
     }
 
     let api_key = env.get("XAI_API_KEY").map(|value| value.trim().to_string());
     let Some(api_key) = api_key.filter(|value| !value.is_empty()) else {
-        eprint!(
-            "xavier: XAI_API_KEY is not set.\n  Run with: doppler run -- xavier \"your query\"\n  Or: export XAI_API_KEY=...\n"
-        );
-        return 2;
+        let error = AppError::missing_api_key();
+        report(&error, json_errors);
+        return error.exit_code();
     };
 
     let raw = match request_x_posts(&options, &api_key, Some(&base_url)) {
         Ok(raw) => raw,
         Err(error) => {
-            report(&error);
+            report(&error, json_errors);
             return error.exit_code();
         }
     };
@@ -182,7 +196,7 @@ pub fn run(argv: Vec<String>) -> i32 {
     let mut result = match build_result(&raw.raw, &options, raw.elapsed_ms) {
         Ok(result) => result,
         Err(error) => {
-            report(&error);
+            report(&error, json_errors);
             return error.exit_code();
         }
     };
@@ -309,11 +323,16 @@ fn render_cached(loaded: LoadedCache, options: &Options, ledger_path: Option<&Pa
     0
 }
 
-fn run_stats(options: StatsOptions, env: &HashMap<String, String>, now: DateTime<Utc>) -> i32 {
+fn run_stats(
+    options: StatsOptions,
+    env: &HashMap<String, String>,
+    now: DateTime<Utc>,
+    json_errors: bool,
+) -> i32 {
     let path = match ledger::resolve_path(options.ledger_dir.as_deref(), env) {
         Ok(path) => path,
         Err(error) => {
-            report(&error);
+            report(&error, json_errors);
             return error.exit_code();
         }
     };
@@ -324,7 +343,7 @@ fn run_stats(options: StatsOptions, env: &HashMap<String, String>, now: DateTime
                 format!("Could not read ledger {}: {error}", path.display()),
                 "Check --ledger-dir permissions.",
             );
-            report(&error);
+            report(&error, json_errors);
             return error.exit_code();
         }
     };
@@ -382,11 +401,11 @@ fn record_run(path: &Path, entry: &LedgerEntry, options: &Options) {
     }
 }
 
-fn run_replay(path: &Path, options: &Options) -> i32 {
+fn run_replay(path: &Path, options: &Options, json_errors: bool) -> i32 {
     let source = match read_replay(path) {
         Ok(source) => source,
         Err(error) => {
-            report(&error);
+            report(&error, json_errors);
             return error.exit_code();
         }
     };
@@ -400,7 +419,7 @@ fn run_replay(path: &Path, options: &Options) -> i32 {
             let result = match build_result(&raw, options, 0) {
                 Ok(result) => result,
                 Err(error) => {
-                    report(&error);
+                    report(&error, json_errors);
                     return error.exit_code();
                 }
             };
@@ -472,11 +491,21 @@ fn print_diagnostics(result: &SearchResult, options: &Options, cache: Option<Str
     }
 }
 
-fn report(error: &AppError) {
+fn report(error: &AppError, json_errors: bool) {
+    if json_errors {
+        eprintln!("{}", error.to_json_string());
+        return;
+    }
     eprintln!("xavier: {}", error.message());
     if let Some(hint) = error.hint() {
         eprintln!("  hint: {hint}");
     }
+}
+
+fn json_errors_requested(argv: &[String]) -> bool {
+    argv.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--json-errors" || arg.starts_with("--json-errors="))
 }
 
 fn read_stdin() -> String {

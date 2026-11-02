@@ -302,6 +302,7 @@ mod tests {
             timeout_ms: 180_000,
             dry_run: false,
             verbose: false,
+            json_errors: false,
             ledger: crate::args::LedgerMode::On,
             ledger_dir: None,
             ledger_query: false,

@@ -1,5 +1,6 @@
 pub mod args;
 pub mod cache;
+pub mod capabilities;
 pub mod cli;
 pub mod cost;
 pub mod dates;
