@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
-use crate::dates::{add_days, parse_when};
+use crate::cost::DEFAULT_BUDGET_MULTIPLIER;
+use crate::dates::{add_days, parse_duration_seconds, parse_when};
 use crate::errors::{AppError, Result};
 use crate::types::{Effort, SortMode};
 
@@ -10,6 +12,8 @@ pub const DEFAULT_MODEL: &str = "grok-4.7";
 pub const DEFAULT_LIMIT: usize = 20;
 pub const DEFAULT_MAX_TURNS: usize = 3;
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 180;
+pub const DEFAULT_BUDGET_WINDOW_SECONDS: u64 = 30 * 86_400;
+pub const DEFAULT_CACHE_TTL_SECONDS: u64 = 900;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -19,7 +23,30 @@ pub enum OutputFormat {
     Raw,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerMode {
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMode {
+    On,
+    Off,
+    Refresh,
+}
+
+impl CacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Refresh => "refresh",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Options {
     pub query: String,
     pub format: OutputFormat,
@@ -38,15 +65,34 @@ pub struct Options {
     pub dry_run: bool,
     pub verbose: bool,
     pub json_errors: bool,
+    pub ledger: LedgerMode,
+    pub ledger_dir: Option<String>,
+    pub ledger_query: bool,
+    pub budget_usd: Option<f64>,
+    pub budget_window_seconds: u64,
+    pub budget_multiplier: f64,
+    pub cache: CacheMode,
+    pub cache_ttl_seconds: u64,
+    pub cache_dir: Option<PathBuf>,
+    pub replay: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsOptions {
+    pub json: bool,
+    pub since_seconds: Option<u64>,
+    pub ledger_dir: Option<String>,
+    pub verbose: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParsedCli {
     Help,
     Version,
     Capabilities,
     SchemaOutput,
-    Run(Options),
+    Run(Box<Options>),
+    Stats(StatsOptions),
 }
 
 #[derive(Debug, Default)]
@@ -74,6 +120,18 @@ struct RawValues {
     dry_run: bool,
     verbose: bool,
     json_errors: bool,
+    ledger: Option<String>,
+    ledger_dir: Option<String>,
+    ledger_query: bool,
+    budget_usd: Option<String>,
+    budget_window: Option<String>,
+    budget_multiplier: Option<String>,
+    cache: Option<String>,
+    no_cache: bool,
+    refresh: bool,
+    cache_ttl: Option<String>,
+    cache_dir: Option<String>,
+    replay: Option<String>,
 }
 
 pub fn parse_cli(
@@ -120,6 +178,85 @@ pub fn parse_cli(
                 "dry-run" => set_bool(&mut values.dry_run, attached, "--dry-run")?,
                 "verbose" => set_bool(&mut values.verbose, attached, "--verbose")?,
                 "json-errors" => set_bool(&mut values.json_errors, attached, "--json-errors")?,
+                "ledger-query" => set_bool(&mut values.ledger_query, attached, "--ledger-query")?,
+                "ledger" => {
+                    values.ledger = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--ledger",
+                    )?)
+                }
+                "ledger-dir" => {
+                    values.ledger_dir = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--ledger-dir",
+                    )?)
+                }
+                "budget-usd" => {
+                    values.budget_usd = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--budget-usd",
+                    )?)
+                }
+                "budget-window" => {
+                    values.budget_window = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--budget-window",
+                    )?)
+                }
+                "budget-multiplier" => {
+                    values.budget_multiplier = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--budget-multiplier",
+                    )?)
+                }
+                "no-cache" => set_bool(&mut values.no_cache, attached, "--no-cache")?,
+                "refresh" => set_bool(&mut values.refresh, attached, "--refresh")?,
+                "cache" => {
+                    values.cache =
+                        Some(take_value(attached, argv, index, &mut consumed, "--cache")?)
+                }
+                "cache-ttl" => {
+                    values.cache_ttl = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--cache-ttl",
+                    )?)
+                }
+                "cache-dir" => {
+                    values.cache_dir = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--cache-dir",
+                    )?)
+                }
+                "replay" => {
+                    values.replay = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--replay",
+                    )?)
+                }
                 "model" => {
                     values.model =
                         Some(take_value(attached, argv, index, &mut consumed, "--model")?)
@@ -246,6 +383,10 @@ pub fn parse_cli(
     }
 
     let mut args = positionals;
+    if args.first().map(String::as_str) == Some("stats") {
+        args.remove(0);
+        return parse_stats(args, &values);
+    }
     match args.first().map(String::as_str) {
         Some("help") => return Ok(ParsedCli::Help),
         Some("version") => return Ok(ParsedCli::Version),
@@ -298,6 +439,25 @@ pub fn parse_cli(
         .first()
         .map(|(_, format)| *format)
         .unwrap_or(OutputFormat::Md);
+
+    let cache = parse_cache_mode(&values)?;
+    let cache_ttl_seconds = match values.cache_ttl.as_deref() {
+        Some(raw) => parse_duration_seconds(raw)?,
+        None => DEFAULT_CACHE_TTL_SECONDS,
+    };
+    let cache_dir = match values.cache_dir {
+        Some(raw) => Some(parse_path_value(raw, "--cache-dir")?),
+        None => None,
+    };
+    let replay = match values.replay {
+        Some(raw) => Some(parse_path_value(raw, "--replay")?),
+        None => None,
+    };
+    if replay.is_some() && values.dry_run {
+        return Err(AppError::usage(
+            "Use either --replay or --dry-run, not both.",
+        ));
+    }
 
     let handles = collect_handles(&values.handle, "--handle")?;
     let exclude_handles = collect_handles(&values.exclude_handle, "--exclude-handle")?;
@@ -365,8 +525,31 @@ pub fn parse_cli(
 
     let effort = parse_effort(values.effort.as_deref())?;
     let sort = parse_sort(values.sort.as_deref())?;
+    let ledger = parse_ledger_mode(values.ledger.as_deref())?;
+    let ledger_dir = parse_directory(values.ledger_dir.as_deref(), "--ledger-dir")?;
+    let budget_usd = parse_money(values.budget_usd.as_deref(), "--budget-usd")?;
+    let budget_window_seconds = match values.budget_window.as_deref() {
+        Some(raw) => parse_duration_seconds(raw)?,
+        None => DEFAULT_BUDGET_WINDOW_SECONDS,
+    };
+    let budget_multiplier = match values.budget_multiplier.as_deref() {
+        Some(raw) => parse_multiplier(raw)?,
+        None => DEFAULT_BUDGET_MULTIPLIER,
+    };
+    if budget_usd.is_none() {
+        if values.budget_window.is_some() {
+            return Err(AppError::usage("--budget-window requires --budget-usd."));
+        }
+        if values.budget_multiplier.is_some() {
+            return Err(AppError::usage(
+                "--budget-multiplier requires --budget-usd.",
+            ));
+        }
+    } else if ledger == LedgerMode::Off {
+        return Err(AppError::usage("--budget-usd requires --ledger on."));
+    }
 
-    Ok(ParsedCli::Run(Options {
+    Ok(ParsedCli::Run(Box::new(Options {
         query,
         format,
         model,
@@ -384,7 +567,157 @@ pub fn parse_cli(
         dry_run: values.dry_run,
         verbose: values.verbose,
         json_errors: values.json_errors,
+        ledger,
+        ledger_dir,
+        ledger_query: values.ledger_query,
+        budget_usd,
+        budget_window_seconds,
+        budget_multiplier,
+        cache,
+        cache_ttl_seconds,
+        cache_dir,
+        replay,
+    })))
+}
+
+fn parse_cache_mode(values: &RawValues) -> Result<CacheMode> {
+    let selected = usize::from(values.cache.is_some())
+        + usize::from(values.no_cache)
+        + usize::from(values.refresh);
+    if selected > 1 {
+        return Err(AppError::usage(
+            "Use only one of --cache, --no-cache, and --refresh.",
+        ));
+    }
+    if values.no_cache {
+        return Ok(CacheMode::Off);
+    }
+    if values.refresh {
+        return Ok(CacheMode::Refresh);
+    }
+    match values.cache.as_deref() {
+        None => Ok(CacheMode::On),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "on" => Ok(CacheMode::On),
+            "off" => Ok(CacheMode::Off),
+            "refresh" => Ok(CacheMode::Refresh),
+            _ => Err(AppError::usage("--cache must be on, off, or refresh.")),
+        },
+    }
+}
+
+fn parse_path_value(raw: String, flag: &str) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::usage(format!("{flag} requires a file path.")));
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
+fn parse_stats(positionals: Vec<String>, values: &RawValues) -> Result<ParsedCli> {
+    if let Some(extra) = positionals.first() {
+        return Err(AppError::usage(format!(
+            "stats does not accept the argument \"{extra}\"."
+        )));
+    }
+    if values.jsonl || values.md || values.raw {
+        return Err(AppError::usage("stats supports only --json."));
+    }
+    let rejected = [
+        (values.model.is_some(), "--model"),
+        (!values.handle.is_empty(), "--handle"),
+        (!values.exclude_handle.is_empty(), "--exclude-handle"),
+        (values.from.is_some(), "--from"),
+        (values.to.is_some(), "--to"),
+        (values.until.is_some(), "--until"),
+        (values.limit.is_some(), "--limit"),
+        (values.max_turns.is_some(), "--max-turns"),
+        (values.effort.is_some(), "--effort"),
+        (values.sort.is_some(), "--sort"),
+        (values.timeout.is_some(), "--timeout"),
+        (values.images, "--images"),
+        (values.videos, "--videos"),
+        (values.dry_run, "--dry-run"),
+        (values.ledger_query, "--ledger-query"),
+        (values.budget_usd.is_some(), "--budget-usd"),
+        (values.budget_window.is_some(), "--budget-window"),
+        (values.budget_multiplier.is_some(), "--budget-multiplier"),
+        (values.cache.is_some(), "--cache"),
+        (values.no_cache, "--no-cache"),
+        (values.refresh, "--refresh"),
+        (values.cache_ttl.is_some(), "--cache-ttl"),
+        (values.cache_dir.is_some(), "--cache-dir"),
+        (values.replay.is_some(), "--replay"),
+    ];
+    if let Some((_, flag)) = rejected.iter().find(|(set, _)| *set) {
+        return Err(AppError::usage(format!("stats does not accept {flag}.")));
+    }
+    if parse_ledger_mode(values.ledger.as_deref())? == LedgerMode::Off {
+        return Err(AppError::usage(
+            "stats requires the ledger; remove --ledger off.",
+        ));
+    }
+    let since_seconds = match values.since.as_deref() {
+        Some(raw) => Some(parse_duration_seconds(raw)?),
+        None => None,
+    };
+    Ok(ParsedCli::Stats(StatsOptions {
+        json: values.json,
+        since_seconds,
+        ledger_dir: parse_directory(values.ledger_dir.as_deref(), "--ledger-dir")?,
+        verbose: values.verbose,
     }))
+}
+
+fn parse_ledger_mode(raw: Option<&str>) -> Result<LedgerMode> {
+    let Some(raw) = raw else {
+        return Ok(LedgerMode::On);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" => Ok(LedgerMode::On),
+        "off" => Ok(LedgerMode::Off),
+        _ => Err(AppError::usage("--ledger must be on or off.")),
+    }
+}
+
+fn parse_directory(raw: Option<&str>, flag: &str) -> Result<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::usage(format!("{flag} must not be empty.")));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn parse_money(raw: Option<&str>, flag: &str) -> Result<Option<f64>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim().trim_start_matches('$');
+    let value = trimmed
+        .parse::<f64>()
+        .map_err(|_| AppError::usage(format!("{flag} must be a positive dollar amount.")))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(AppError::usage(format!(
+            "{flag} must be a positive dollar amount."
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn parse_multiplier(raw: &str) -> Result<f64> {
+    let value = raw
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| AppError::usage("--budget-multiplier must be a positive number."))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(AppError::usage(
+            "--budget-multiplier must be a positive number.",
+        ));
+    }
+    Ok(value)
 }
 
 /// Inclusive calendar end date => exclusive xAI `to_date`.
@@ -533,6 +866,7 @@ USAGE
   echo "<query>" | xavier -
   xavier capabilities [--json]
   xavier schema output
+  xavier stats [--since 30d] [--json]
   xavier --help
   xavier --version
 
@@ -547,6 +881,14 @@ OUTPUT
   --jsonl      Result metadata line, then one post per line
   --raw        Raw xAI Responses API payload
   --dry-run    Print the API request body and exit without spending credits
+  --replay <file>  Render a raw response or cache entry offline
+
+CACHE
+      --cache <mode>             on | off | refresh (default on)
+      --no-cache                 Alias for --cache off
+      --refresh                  Alias for --cache refresh
+      --cache-ttl <duration>     Entry lifetime: 15m, 1h, 7d (default 15m)
+      --cache-dir <path>         Cache directory (or XAVIER_CACHE_DIR)
 
 FILTERS
   -u, --handle <handle>          Only these authors (repeatable, comma-separated, max 20)
@@ -559,6 +901,14 @@ FILTERS
       --effort <level>           low | medium | high | xhigh (Grok 4.5+, default low)
       --images                   Let the model view images inside posts
       --videos                   Let the model watch videos inside posts
+
+LEDGER
+      --ledger <on|off>          Record successful runs (default on)
+      --ledger-dir <path>        Ledger directory (also XAVIER_LEDGER_DIR)
+      --ledger-query             Store query text; default stores only a hash
+      --budget-usd <amount>      Refuse to run when window spend would exceed it (exit 4)
+      --budget-window <duration> Budget window: 30d, 12h, 2w (default 30d)
+      --budget-multiplier <n>    Soft preflight estimate multiplier (default 3)
 
 OTHER
       --model <id>               xAI model (default {DEFAULT_MODEL})
@@ -578,6 +928,8 @@ EXAMPLES
   xavier "what are people saying about Grok 4.7"
   xavier search "rust async" --from 7d --limit 10 --json
   xavier "from:xai min_likes:100" --sort top
+  xavier "grok 4.7" --budget-usd 5 --budget-window 30d
+  xavier stats --since 7d
   xavier - < query.txt
 "#
     )
@@ -606,7 +958,7 @@ mod tests {
     fn options_with(argv: &[&str], env_pairs: &[(&str, &str)]) -> Options {
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
         match parse_cli(&argv, &env(env_pairs), now()).expect("expected a run command") {
-            ParsedCli::Run(options) => options,
+            ParsedCli::Run(options) => *options,
             other => panic!("expected run, got {other:?}"),
         }
     }
@@ -614,6 +966,14 @@ mod tests {
     fn error(argv: &[&str]) -> AppError {
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
         parse_cli(&argv, &env(&[]), now()).expect_err("expected a usage error")
+    }
+
+    fn stats(argv: &[&str]) -> StatsOptions {
+        let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+        match parse_cli(&argv, &env(&[]), now()).expect("expected a stats command") {
+            ParsedCli::Stats(options) => options,
+            other => panic!("expected stats, got {other:?}"),
+        }
     }
 
     #[test]
@@ -626,6 +986,10 @@ mod tests {
         assert_eq!(options.max_turns, 3);
         assert_eq!(options.effort, Effort::Low);
         assert_eq!(options.timeout_ms, 180_000);
+        assert_eq!(options.cache, CacheMode::On);
+        assert_eq!(options.cache_ttl_seconds, 900);
+        assert_eq!(options.cache_dir, None);
+        assert_eq!(options.replay, None);
     }
 
     #[test]
@@ -763,6 +1127,109 @@ mod tests {
         assert!(options.images);
         assert!(options.videos);
         assert!(options.dry_run);
+    }
+
+    #[test]
+    fn parses_ledger_and_budget_flags() {
+        let defaults = run(&["grok"]);
+        assert_eq!(defaults.ledger, LedgerMode::On);
+        assert_eq!(defaults.ledger_dir, None);
+        assert!(!defaults.ledger_query);
+        assert_eq!(defaults.budget_usd, None);
+        assert_eq!(
+            defaults.budget_window_seconds,
+            DEFAULT_BUDGET_WINDOW_SECONDS
+        );
+        assert_eq!(defaults.budget_multiplier, DEFAULT_BUDGET_MULTIPLIER);
+
+        let options = run(&[
+            "grok",
+            "--ledger",
+            "off",
+            "--ledger-dir",
+            "/tmp/xavier",
+            "--ledger-query",
+        ]);
+        assert_eq!(options.ledger, LedgerMode::Off);
+        assert_eq!(options.ledger_dir.as_deref(), Some("/tmp/xavier"));
+        assert!(options.ledger_query);
+
+        let budget = run(&[
+            "grok",
+            "--budget-usd",
+            "$0.50",
+            "--budget-window",
+            "12h",
+            "--budget-multiplier",
+            "2",
+        ]);
+        assert_eq!(budget.budget_usd, Some(0.5));
+        assert_eq!(budget.budget_window_seconds, 43_200);
+        assert_eq!(budget.budget_multiplier, 2.0);
+
+        assert!(error(&["--ledger", "maybe"]).is_usage());
+        assert!(error(&["--ledger-dir", ""]).is_usage());
+        assert!(error(&["--budget-usd", "0"]).is_usage());
+        assert!(error(&["--budget-usd", "-1"]).is_usage());
+        assert!(error(&["--budget-usd", "free"]).is_usage());
+        assert!(error(&["--budget-window", "30"]).is_usage());
+        assert!(error(&["--budget-multiplier", "0"]).is_usage());
+        assert!(error(&["--budget-window", "7d"]).is_usage());
+        assert!(error(&["--budget-multiplier", "2"]).is_usage());
+        assert!(error(&["--budget-usd", "5", "--ledger", "off"]).is_usage());
+    }
+
+    #[test]
+    fn parses_the_stats_subcommand() {
+        let options = stats(&["stats", "--since", "7d", "--json", "--verbose"]);
+        assert!(options.json);
+        assert_eq!(options.since_seconds, Some(7 * 86_400));
+        assert!(options.verbose);
+
+        let all = stats(&["stats"]);
+        assert!(!all.json);
+        assert_eq!(all.since_seconds, None);
+        assert_eq!(all.ledger_dir, None);
+
+        let with_dir = stats(&["stats", "--ledger-dir", "/tmp/ledger"]);
+        assert_eq!(with_dir.ledger_dir.as_deref(), Some("/tmp/ledger"));
+
+        assert!(error(&["stats", "--since", "last week"]).is_usage());
+        assert!(error(&["stats", "--limit", "5"]).is_usage());
+        assert!(error(&["stats", "--jsonl"]).is_usage());
+        assert!(error(&["stats", "--ledger", "off"]).is_usage());
+        assert!(error(&["stats", "extra"]).is_usage());
+        assert!(error(&["stats", "--cache", "off"]).is_usage());
+    }
+
+    #[test]
+    fn parses_cache_modes_and_aliases() {
+        assert_eq!(run(&["--cache", "off"]).cache, CacheMode::Off);
+        assert_eq!(run(&["--cache=refresh"]).cache, CacheMode::Refresh);
+        assert_eq!(run(&["--cache", "on"]).cache, CacheMode::On);
+        assert_eq!(run(&["--no-cache"]).cache, CacheMode::Off);
+        assert_eq!(run(&["--refresh"]).cache, CacheMode::Refresh);
+        assert!(error(&["--cache", "maybe"]).is_usage());
+        assert!(error(&["--no-cache", "--refresh"]).is_usage());
+        assert!(error(&["--cache", "off", "--no-cache"]).is_usage());
+    }
+
+    #[test]
+    fn parses_cache_ttl_and_paths() {
+        assert_eq!(run(&["--cache-ttl", "1h"]).cache_ttl_seconds, 3_600);
+        assert_eq!(run(&["--cache-ttl=7d"]).cache_ttl_seconds, 604_800);
+        assert_eq!(
+            run(&["--cache-dir", "/tmp/xavier-cache"]).cache_dir,
+            Some(PathBuf::from("/tmp/xavier-cache"))
+        );
+        assert_eq!(
+            run(&["--replay", "result.json"]).replay,
+            Some(PathBuf::from("result.json"))
+        );
+        assert!(error(&["--cache-ttl", "15"]).is_usage());
+        assert!(error(&["--cache-dir", ""]).is_usage());
+        assert!(error(&["--replay", ""]).is_usage());
+        assert!(error(&["--replay", "result.json", "--dry-run"]).is_usage());
     }
 
     #[test]

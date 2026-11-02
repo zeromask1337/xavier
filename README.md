@@ -164,10 +164,86 @@ converted to the exclusive `to_date` that xAI expects.
       { "name": "x_keyword_search", "query": "\"Grok 4.7\"", "mode": "Latest" }
     ],
     "citations": 15,
-    "warnings": []
+    "warnings": [],
+    "cache": { "hit": false, "age_seconds": null, "saved_usd": null }
   }
 }
 ```
+
+### Spend ledger and budget
+
+Every successful run appends one line to an append-only JSONL ledger:
+
+```json
+{"ts":"2026-11-02T12:00:00.000Z","cost_usd":0.001234,"cost_source":"api","posts_fetched":3,"model":"grok-4.7","query_hash":"...","cached":false}
+```
+
+The default location is the platform data directory:
+
+| Platform | Path |
+| --- | --- |
+| Linux | `$XDG_DATA_HOME/xavier/ledger.jsonl`, or `~/.local/share/xavier/ledger.jsonl` |
+| macOS | `~/Library/Application Support/xavier/ledger.jsonl` |
+| Windows | `%LOCALAPPDATA%\xavier\ledger.jsonl` |
+
+`--ledger-dir <path>` and `XAVIER_LEDGER_DIR` override the directory. The flag wins
+over the environment variable. On Unix the ledger file is created with `0600`
+permissions.
+
+Only a SHA-256 hash of the whitespace-normalized query is stored by default. Pass
+`--ledger-query` if you need the query text in the ledger.
+
+```sh
+xavier stats                 # all-time totals
+xavier stats --since 7d      # last 7 days
+xavier stats --json          # machine-readable totals
+```
+
+`stats` reports run count, total cost, cache hits, fetched posts, and totals by day
+and model. Corrupt or partial ledger lines are skipped. Cache hits are recorded with
+`cost_usd = 0` and `cached = true`.
+
+| Flag | Description |
+| --- | --- |
+| `--ledger <on\|off>` | Record successful runs. Default `on`. |
+| `--ledger-dir <path>` | Ledger directory. |
+| `--ledger-query` | Store query text. Off by default. |
+| `--budget-usd <amount>` | Refuse to start when window spend plus the soft estimate would exceed this amount. |
+| `--budget-window <duration>` | Budget window: `30d`, `12h`, `2w`. Default `30d`. |
+| `--budget-multiplier <n>` | Preflight estimate multiplier. Default `3`. |
+
+The preflight estimate is deliberately soft: `x_posts_fetched` can exceed `--limit`, so
+it prices `--limit * --budget-multiplier` posts at $0.005 each. The check runs before
+the request and refuses with exit code 4. After a response, the ledger is updated and
+the hard check warns if the window now exceeds the budget; further runs are refused.
+A budget cannot undo spend from the request that already completed.
+
+### Cache
+
+Successful results, including zero-post results, are cached on disk for 15 minutes by
+default. Repeating the same request reuses the stored result instead of paying xAI again.
+The key covers the query, base URL, model, effort, turn limit, post limit, date and author
+filters, sort hint, and image/video flags. `meta.cache` reports whether a result was a hit,
+how old the entry was, and the API cost the hit avoided; Markdown adds `cache=hit`.
+
+| Flag | Description |
+| --- | --- |
+| `--cache <on\|off\|refresh>` | Read and write (`on`, default), bypass everything (`off`), or skip reads and replace the entry (`refresh`). |
+| `--no-cache` | Alias for `--cache off`. |
+| `--refresh` | Alias for `--cache refresh`. |
+| `--cache-ttl <duration>` | Entry lifetime such as `15m`, `1h`, `7d`. Default 15 minutes. |
+| `--cache-dir <path>` | Cache directory. `XAVIER_CACHE_DIR` also works. |
+| `--replay <file>` | Render a raw xAI response or a xavier cache entry offline. |
+
+The cache directory is `XAVIER_CACHE_DIR` when set, otherwise `~/Library/Caches/xavier`
+on macOS, `%LOCALAPPDATA%\xavier` on Windows, or `$XDG_CACHE_HOME/xavier`
+(`~/.cache/xavier` fallback) elsewhere. Entries are written atomically with `0600`
+permissions. Cached post text is stored as plain JSON readable by your user account;
+delete the cache directory to clear it. Corrupt or expired entries are ignored and removed.
+
+Cache hits are resolved before `XAI_API_KEY` is checked, so repeat queries and `--replay`
+work offline. `--raw` runs may read a cached payload but never write one; `--dry-run` does
+not touch the cache. Replay does not require a key and never makes a request.
 
 ### Other flags
 
@@ -220,7 +296,7 @@ stderr and stdout stays empty:
 | `invalid_response` | 1 | no | The response was malformed or unparseable. |
 | `incomplete` | 1 | yes | The model stopped before finishing; raise `--max-turns` or retry. |
 | `placeholder` | 1 | yes | The model returned a placeholder instead of results. |
-| `budget_exceeded` | 4 | no | Reserved for the spending ledger. |
+| `budget_exceeded` | 4 | no | The window spend plus the preflight estimate would exceed `--budget-usd`. |
 | `empty` | 2 | no | No query was provided. |
 
 Retry only when `retryable` is `true`, and back off between attempts. For `auth`,
@@ -234,4 +310,16 @@ Use `hint` for the suggested remediation.
 | 0 | Success, including zero matches. |
 | 1 | API, network, or response error. |
 | 2 | Usage or configuration error (bad flag, missing key, empty query). |
-| 4 | Reserved for budget exhaustion. |
+| 4 | Budget refusal: the window spend plus the preflight estimate exceeds `--budget-usd`. |
+
+## Architecture
+
+- `src/cli.rs` — command flow: replay, cache lookup, budget preflight, request, store, ledger, render.
+- `src/cache.rs` — SHA-256 cache keys, directory resolution, atomic load/store, replay parsing.
+- `src/ledger.rs` — JSONL ledger, spend aggregation, stats, and budget checks.
+- `src/xai.rs` — request construction, xAI HTTP, response normalization and citations.
+- `src/output.rs` — Markdown, JSON, JSONL, and stats rendering.
+- `src/args.rs` — flags, `CacheMode`, `LedgerMode`, `stats` parsing, option validation.
+- `src/dates.rs` — date and duration parsing.
+- `src/cost.rs`, `src/errors.rs`, `src/types.rs` — cost estimates, errors, shared types.
+- `src/capabilities.rs` — stable error catalog, exit codes, and output schema for agents.

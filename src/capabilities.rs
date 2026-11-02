@@ -1,6 +1,10 @@
 use serde_json::{Value, json};
 
-use crate::args::{DEFAULT_LIMIT, DEFAULT_MAX_TURNS, DEFAULT_MODEL, DEFAULT_TIMEOUT_SECONDS};
+use crate::args::{
+    DEFAULT_BUDGET_WINDOW_SECONDS, DEFAULT_CACHE_TTL_SECONDS, DEFAULT_LIMIT, DEFAULT_MAX_TURNS,
+    DEFAULT_MODEL, DEFAULT_TIMEOUT_SECONDS,
+};
+use crate::cost::DEFAULT_BUDGET_MULTIPLIER;
 use crate::errors::ErrorCode;
 use crate::types::SCHEMA_VERSION;
 
@@ -44,6 +48,11 @@ pub fn manifest() -> Value {
                         "description": "JSON Schema for the SearchResult object."
                     }
                 ]
+            },
+            {
+                "name": "stats",
+                "usage": "xavier stats [--since 30d] [--json]",
+                "description": "Summarize spend, cache hits, and fetched posts from the local ledger."
             },
             {
                 "name": "help",
@@ -163,6 +172,68 @@ pub fn manifest() -> Value {
                 "description": "Diagnostics on stderr."
             },
             {
+                "name": "--ledger",
+                "type": "string",
+                "values": ["on", "off"],
+                "description": "Record successful runs in the local ledger."
+            },
+            {
+                "name": "--ledger-dir",
+                "type": "string",
+                "description": "Ledger directory."
+            },
+            {
+                "name": "--ledger-query",
+                "type": "boolean",
+                "description": "Store query text in the ledger instead of only its hash."
+            },
+            {
+                "name": "--budget-usd",
+                "type": "number",
+                "description": "Refuse to run when the window spend plus the preflight estimate would exceed this amount."
+            },
+            {
+                "name": "--budget-window",
+                "type": "string",
+                "description": "Budget window such as 30d, 12h, or 2w."
+            },
+            {
+                "name": "--budget-multiplier",
+                "type": "number",
+                "description": "Soft preflight estimate multiplier."
+            },
+            {
+                "name": "--cache",
+                "type": "string",
+                "values": ["on", "off", "refresh"],
+                "description": "Read and write, bypass, or replace cached results."
+            },
+            {
+                "name": "--no-cache",
+                "type": "boolean",
+                "description": "Alias for --cache off."
+            },
+            {
+                "name": "--refresh",
+                "type": "boolean",
+                "description": "Alias for --cache refresh."
+            },
+            {
+                "name": "--cache-ttl",
+                "type": "string",
+                "description": "Cache entry lifetime such as 15m, 1h, or 7d."
+            },
+            {
+                "name": "--cache-dir",
+                "type": "string",
+                "description": "Cache directory."
+            },
+            {
+                "name": "--replay",
+                "type": "string",
+                "description": "Render a raw response or cache entry offline."
+            },
+            {
                 "name": "--help",
                 "alias": "-h",
                 "type": "boolean",
@@ -181,14 +252,21 @@ pub fn manifest() -> Value {
             "max_turns": DEFAULT_MAX_TURNS,
             "effort": "low",
             "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
-            "output_format": "md"
+            "output_format": "md",
+            "ledger": "on",
+            "budget_window_seconds": DEFAULT_BUDGET_WINDOW_SECONDS,
+            "budget_multiplier": DEFAULT_BUDGET_MULTIPLIER,
+            "cache": "on",
+            "cache_ttl_seconds": DEFAULT_CACHE_TTL_SECONDS
         },
         "limits": {
             "limit": { "min": 1, "max": 100 },
             "max_turns": { "min": 1, "max": 10 },
             "timeout_seconds": { "min": 5, "max": 600 },
             "handles_per_list": 20,
-            "query": { "min_length": 1 }
+            "query": { "min_length": 1 },
+            "budget_usd": { "exclusive_minimum": 0 },
+            "budget_multiplier": { "exclusive_minimum": 0 }
         },
         "output_formats": ["md", "json", "jsonl", "raw"],
         "environment_variables": [
@@ -208,13 +286,23 @@ pub fn manifest() -> Value {
                 "required": false,
                 "default": DEFAULT_MODEL,
                 "description": "Default model when --model is absent."
+            },
+            {
+                "name": "XAVIER_LEDGER_DIR",
+                "required": false,
+                "description": "Ledger directory when --ledger-dir is absent."
+            },
+            {
+                "name": "XAVIER_CACHE_DIR",
+                "required": false,
+                "description": "Cache directory when --cache-dir is absent."
             }
         ],
         "exit_codes": [
             { "code": 0, "meaning": "success" },
             { "code": 1, "meaning": "runtime error" },
             { "code": 2, "meaning": "usage or configuration error" },
-            { "code": 4, "meaning": "reserved for budget exhaustion" }
+            { "code": 4, "meaning": "budget exhausted or refused" }
         ],
         "error_codes": error_codes
     })
@@ -399,7 +487,23 @@ pub fn output_schema() -> Value {
                     "warnings": {
                         "type": "array",
                         "items": { "type": "string" }
+                    },
+                    "cache": {
+                        "anyOf": [
+                            { "$ref": "#/$defs/cache_meta" },
+                            { "type": "null" }
+                        ]
                     }
+                }
+            },
+            "cache_meta": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["hit", "age_seconds", "saved_usd"],
+                "properties": {
+                    "hit": { "type": "boolean" },
+                    "age_seconds": { "type": ["integer", "null"], "minimum": 0 },
+                    "saved_usd": { "type": ["number", "null"] }
                 }
             }
         }
@@ -432,7 +536,7 @@ mod tests {
         assert_eq!(manifest["schema_version"], SCHEMA_VERSION);
 
         let commands = manifest["commands"].as_array().unwrap();
-        for name in ["search", "capabilities", "schema"] {
+        for name in ["search", "capabilities", "schema", "stats"] {
             assert!(
                 commands.iter().any(|command| command["name"] == name),
                 "missing command {name}"
@@ -445,7 +549,16 @@ mod tests {
             .iter()
             .map(|flag| flag["name"].as_str().unwrap())
             .collect();
-        for name in ["--json-errors", "--json", "--jsonl", "--limit", "--timeout"] {
+        for name in [
+            "--json-errors",
+            "--json",
+            "--jsonl",
+            "--limit",
+            "--timeout",
+            "--cache",
+            "--ledger",
+            "--budget-usd",
+        ] {
             assert!(flags.contains(&name), "missing flag {name}");
         }
 

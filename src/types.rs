@@ -107,6 +107,16 @@ pub struct Filters {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheMeta {
+    /// True when the result came from the on-disk cache instead of the API.
+    pub hit: bool,
+    /// Age of the cache entry at the time it was read, in seconds.
+    pub age_seconds: Option<u64>,
+    /// API cost that this cache hit avoided, when known.
+    pub saved_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Meta {
     pub model: String,
     pub response_id: Option<String>,
@@ -119,6 +129,8 @@ pub struct Meta {
     pub searches: Vec<SearchCall>,
     pub citations: usize,
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheMeta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -166,6 +166,10 @@ impl AppError {
 
     /// Preserve the established exit codes: 0 success, 1 runtime, 2 usage.
     /// Exit code 4 is reserved for budget exhaustion.
+    pub fn budget(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self::new(ErrorCode::BudgetExceeded, message).with_hint(hint)
+    }
+
     pub fn exit_code(&self) -> i32 {
         self.code.exit_code()
     }
