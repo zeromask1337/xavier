@@ -4,13 +4,19 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
-use crate::args::{LedgerMode, Options, ParsedCli, StatsOptions, help_text, parse_cli};
+use crate::args::{
+    CacheMode, LedgerMode, Options, OutputFormat, ParsedCli, StatsOptions, help_text, parse_cli,
+};
+use crate::cache::{CacheEntry, CacheStore, LoadedCache, ReplaySource, cache_key, read_replay};
 use crate::cost::{estimate_run_cost, format_usd, round_usd};
 use crate::dates::format_duration_seconds;
 use crate::errors::AppError;
 use crate::ledger::{self, LedgerEntry, RunRecord};
 use crate::output::{render_json, render_jsonl, render_markdown, render_stats, render_stats_json};
-use crate::xai::{build_request_body, build_result, request_x_posts, summarize_raw};
+use crate::types::{CacheMeta, SearchResult};
+use crate::xai::{
+    build_request_body, build_result, request_x_posts, resolve_base_url, summarize_raw,
+};
 
 pub fn run(argv: Vec<String>) -> i32 {
     let env: HashMap<String, String> = std::env::vars().collect();
@@ -34,8 +40,14 @@ pub fn run(argv: Vec<String>) -> i32 {
             return 0;
         }
         ParsedCli::Stats(options) => return run_stats(options, &env, now),
-        ParsedCli::Run(options) => options,
+        ParsedCli::Run(options) => *options,
     };
+
+    let base_url = resolve_base_url(env.get("XAI_BASE_URL").map(String::as_str));
+
+    if let Some(path) = options.replay.clone() {
+        return run_replay(&path, &options);
+    }
 
     let mut query = options.query.clone();
     if query == "-" || (query.is_empty() && !io::stdin().is_terminal()) {
@@ -74,6 +86,16 @@ pub fn run(argv: Vec<String>) -> i32 {
     } else {
         None
     };
+
+    let store = CacheStore::from_options(&options, &env);
+    let key = cache_key(&options, &base_url);
+
+    if let Some(store) = &store
+        && options.cache != CacheMode::Refresh
+        && let Some(loaded) = store.load(&key, now.timestamp())
+    {
+        return render_cached(loaded, &options, ledger_path.as_deref());
+    }
 
     if let (Some(path), Some(budget)) = (&ledger_path, options.budget_usd) {
         let entries = match ledger::read_entries(path) {
@@ -119,8 +141,7 @@ pub fn run(argv: Vec<String>) -> i32 {
         return 2;
     };
 
-    let base_url = env.get("XAI_BASE_URL").map(String::as_str);
-    let raw = match request_x_posts(&options, &api_key, base_url) {
+    let raw = match request_x_posts(&options, &api_key, Some(&base_url)) {
         Ok(raw) => raw,
         Err(error) => {
             report(&error);
@@ -128,12 +149,15 @@ pub fn run(argv: Vec<String>) -> i32 {
         }
     };
 
-    if options.format == crate::args::OutputFormat::Raw {
+    if options.format == OutputFormat::Raw {
         println!(
             "{}",
             serde_json::to_string_pretty(&raw.raw).expect("raw payload is serializable")
         );
         if options.verbose {
+            if let Some(store) = &store {
+                eprintln!("xavier: cache=miss key={}", store.path(&key).display());
+            }
             eprintln!("xavier: raw response received in {}ms", raw.elapsed_ms);
         }
         if let Some(path) = &ledger_path {
@@ -155,7 +179,7 @@ pub fn run(argv: Vec<String>) -> i32 {
         return 0;
     }
 
-    let result = match build_result(&raw.raw, &options, raw.elapsed_ms) {
+    let mut result = match build_result(&raw.raw, &options, raw.elapsed_ms) {
         Ok(result) => result,
         Err(error) => {
             report(&error);
@@ -163,45 +187,38 @@ pub fn run(argv: Vec<String>) -> i32 {
         }
     };
 
-    match options.format {
-        crate::args::OutputFormat::Json => print!("{}", render_json(&result)),
-        crate::args::OutputFormat::Jsonl => print!("{}", render_jsonl(&result)),
-        crate::args::OutputFormat::Md => print!("{}", render_markdown(&result)),
-        crate::args::OutputFormat::Raw => unreachable!("raw is handled above"),
+    if let Some(store) = &store {
+        let entry = CacheEntry::new(
+            key.clone(),
+            &result,
+            raw.raw.clone(),
+            Utc::now().timestamp(),
+        );
+        match store.store(&entry) {
+            Ok(()) => {
+                if options.verbose {
+                    eprintln!(
+                        "xavier: cache=stored key={} path={}",
+                        key,
+                        store.path(&key).display()
+                    );
+                }
+            }
+            Err(error) => {
+                if options.verbose {
+                    eprintln!("xavier: cache=store-failed {error}");
+                }
+            }
+        }
+        result.meta.cache = Some(CacheMeta {
+            hit: false,
+            age_seconds: None,
+            saved_usd: None,
+        });
     }
 
-    if options.verbose {
-        let mut diagnostics = vec![format!(
-            "model={} effort={} max_turns={}",
-            options.model,
-            options.effort.as_str(),
-            options.max_turns
-        )];
-        for search in &result.meta.searches {
-            let mut line = format!("search {}", search.name);
-            if let Some(query) = &search.query {
-                line.push_str(&format!(" \"{query}\""));
-            }
-            if let Some(mode) = &search.mode {
-                line.push_str(&format!(" ({mode})"));
-            }
-            diagnostics.push(line);
-        }
-        diagnostics.push(format!(
-            "response={} posts={} fetched={} cost={} elapsed={}ms",
-            result.meta.response_id.as_deref().unwrap_or("unknown"),
-            result.posts.len(),
-            result.meta.usage.x_posts_fetched,
-            format_usd(result.meta.usage.cost_usd),
-            result.meta.elapsed_ms
-        ));
-        if let Some(path) = &ledger_path {
-            diagnostics.push(format!("ledger={}", path.display()));
-        }
-        for line in diagnostics {
-            eprintln!("xavier: {line}");
-        }
-    }
+    print_result(&result, options.format);
+    print_diagnostics(&result, &options, None);
 
     if let Some(path) = &ledger_path {
         let entry = LedgerEntry::new(
@@ -217,6 +234,76 @@ pub fn run(argv: Vec<String>) -> i32 {
             Utc::now(),
         );
         record_run(path, &entry, &options);
+    }
+
+    0
+}
+
+fn render_cached(loaded: LoadedCache, options: &Options, ledger_path: Option<&Path>) -> i32 {
+    let saved_usd = loaded.entry.result.meta.usage.cost_usd;
+
+    if options.format == OutputFormat::Raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&loaded.entry.raw).expect("raw payload is serializable")
+        );
+        if options.verbose {
+            eprintln!(
+                "xavier: cache=hit age={}s saved={}",
+                loaded.age_seconds,
+                format_usd(saved_usd)
+            );
+        }
+        if let Some(path) = ledger_path {
+            let entry = LedgerEntry::new(
+                &RunRecord {
+                    query: &loaded.entry.result.query,
+                    model: &loaded.entry.result.meta.model,
+                    cost_usd: saved_usd,
+                    cost_source: loaded.entry.result.meta.usage.cost_source,
+                    posts_fetched: loaded.entry.result.meta.usage.x_posts_fetched,
+                    cached: true,
+                    store_query: options.ledger_query,
+                },
+                Utc::now(),
+            );
+            record_run(path, &entry, options);
+        }
+        return 0;
+    }
+
+    let mut result = loaded.entry.result.clone();
+    result.meta.cache = Some(CacheMeta {
+        hit: true,
+        age_seconds: Some(loaded.age_seconds),
+        saved_usd,
+    });
+
+    print_result(&result, options.format);
+    print_diagnostics(
+        &result,
+        options,
+        Some(format!(
+            "cache=hit age={}s saved={}",
+            loaded.age_seconds,
+            format_usd(saved_usd)
+        )),
+    );
+
+    if let Some(path) = ledger_path {
+        let entry = LedgerEntry::new(
+            &RunRecord {
+                query: &result.query,
+                model: &result.meta.model,
+                cost_usd: result.meta.usage.cost_usd,
+                cost_source: result.meta.usage.cost_source,
+                posts_fetched: result.meta.usage.x_posts_fetched,
+                cached: true,
+                store_query: options.ledger_query,
+            },
+            Utc::now(),
+        );
+        record_run(path, &entry, options);
     }
 
     0
@@ -292,6 +379,96 @@ fn record_run(path: &Path, entry: &LedgerEntry, options: &Options) {
             format_duration_seconds(options.budget_window_seconds),
             format_usd(Some(budget))
         );
+    }
+}
+
+fn run_replay(path: &Path, options: &Options) -> i32 {
+    let source = match read_replay(path) {
+        Ok(source) => source,
+        Err(error) => {
+            report(&error);
+            return error.exit_code();
+        }
+    };
+
+    let (raw, mut result) = match source {
+        ReplaySource::Cache(entry) => {
+            let entry = *entry;
+            (entry.raw, entry.result)
+        }
+        ReplaySource::Raw(raw) => {
+            let result = match build_result(&raw, options, 0) {
+                Ok(result) => result,
+                Err(error) => {
+                    report(&error);
+                    return error.exit_code();
+                }
+            };
+            (raw, result)
+        }
+    };
+
+    // Replay is offline and does not read or write the cache.
+    result.meta.cache = None;
+
+    if options.format == OutputFormat::Raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&raw).expect("raw payload is serializable")
+        );
+        return 0;
+    }
+
+    print_result(&result, options.format);
+    print_diagnostics(&result, options, Some(format!("replay={}", path.display())));
+
+    0
+}
+
+fn print_result(result: &SearchResult, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => print!("{}", render_json(result)),
+        OutputFormat::Jsonl => print!("{}", render_jsonl(result)),
+        OutputFormat::Md => print!("{}", render_markdown(result)),
+        OutputFormat::Raw => unreachable!("raw is handled before rendering"),
+    }
+}
+
+fn print_diagnostics(result: &SearchResult, options: &Options, cache: Option<String>) {
+    if !options.verbose {
+        return;
+    }
+
+    let mut diagnostics = Vec::new();
+    if let Some(cache) = cache {
+        diagnostics.push(cache);
+    }
+    diagnostics.push(format!(
+        "model={} effort={} max_turns={}",
+        options.model,
+        options.effort.as_str(),
+        options.max_turns
+    ));
+    for search in &result.meta.searches {
+        let mut line = format!("search {}", search.name);
+        if let Some(query) = &search.query {
+            line.push_str(&format!(" \"{query}\""));
+        }
+        if let Some(mode) = &search.mode {
+            line.push_str(&format!(" ({mode})"));
+        }
+        diagnostics.push(line);
+    }
+    diagnostics.push(format!(
+        "response={} posts={} fetched={} cost={} elapsed={}ms",
+        result.meta.response_id.as_deref().unwrap_or("unknown"),
+        result.posts.len(),
+        result.meta.usage.x_posts_fetched,
+        format_usd(result.meta.usage.cost_usd),
+        result.meta.elapsed_ms
+    ));
+    for line in diagnostics {
+        eprintln!("xavier: {line}");
     }
 }
 

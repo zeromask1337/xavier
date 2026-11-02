@@ -11,6 +11,9 @@ use crate::errors::{AppError, Result};
 use crate::types::{CostSource, Meta, Post, SearchCall, SearchResult, Usage};
 
 pub const API_BASE: &str = "https://api.x.ai/v1";
+/// Bump when the system prompt or structured result schema changes so cached
+/// results are not reused across incompatible prompts.
+pub const PROMPT_VERSION: u32 = 1;
 const TICKS_PER_USD: f64 = 10_000_000_000.0;
 
 const SYSTEM_PROMPT: &str = r#"You are xavier, a search engine for X (Twitter) posts.
@@ -215,17 +218,21 @@ fn result_schema(limit: usize) -> Value {
     })
 }
 
+pub fn resolve_base_url(override_url: Option<&str>) -> String {
+    override_url
+        .map(str::to_string)
+        .or_else(|| std::env::var("XAI_BASE_URL").ok())
+        .unwrap_or_else(|| API_BASE.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
 pub fn request_x_posts(
     options: &Options,
     api_key: &str,
     base_url_override: Option<&str>,
 ) -> Result<RawResponse> {
-    let base_url = base_url_override
-        .map(str::to_string)
-        .or_else(|| std::env::var("XAI_BASE_URL").ok())
-        .unwrap_or_else(|| API_BASE.to_string())
-        .trim_end_matches('/')
-        .to_string();
+    let base_url = resolve_base_url(base_url_override);
     let url = format!("{base_url}/responses");
     let body = serde_json::to_string(&build_request_body(options))
         .map_err(|error| AppError::runtime(format!("Could not serialize request: {error}")))?;
@@ -436,6 +443,7 @@ pub fn build_result(data: &Value, options: &Options, elapsed_ms: u64) -> Result<
         searches,
         citations: cited_ids.len(),
         warnings,
+        cache: None,
     };
 
     Ok(SearchResult {
@@ -902,6 +910,10 @@ mod tests {
             budget_usd: None,
             budget_window_seconds: DEFAULT_BUDGET_WINDOW_SECONDS,
             budget_multiplier: crate::cost::DEFAULT_BUDGET_MULTIPLIER,
+            cache: crate::args::CacheMode::On,
+            cache_ttl_seconds: 900,
+            cache_dir: None,
+            replay: None,
         }
     }
 

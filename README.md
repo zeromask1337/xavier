@@ -162,7 +162,8 @@ converted to the exclusive `to_date` that xAI expects.
       { "name": "x_keyword_search", "query": "\"Grok 4.7\"", "mode": "Latest" }
     ],
     "citations": 15,
-    "warnings": []
+    "warnings": [],
+    "cache": { "hit": false, "age_seconds": null, "saved_usd": null }
   }
 }
 ```
@@ -215,6 +216,33 @@ the request and refuses with exit code 4. After a response, the ledger is update
 the hard check warns if the window now exceeds the budget; further runs are refused.
 A budget cannot undo spend from the request that already completed.
 
+### Cache
+
+Successful results, including zero-post results, are cached on disk for 15 minutes by
+default. Repeating the same request reuses the stored result instead of paying xAI again.
+The key covers the query, base URL, model, effort, turn limit, post limit, date and author
+filters, sort hint, and image/video flags. `meta.cache` reports whether a result was a hit,
+how old the entry was, and the API cost the hit avoided; Markdown adds `cache=hit`.
+
+| Flag | Description |
+| --- | --- |
+| `--cache <on\|off\|refresh>` | Read and write (`on`, default), bypass everything (`off`), or skip reads and replace the entry (`refresh`). |
+| `--no-cache` | Alias for `--cache off`. |
+| `--refresh` | Alias for `--cache refresh`. |
+| `--cache-ttl <duration>` | Entry lifetime such as `15m`, `1h`, `7d`. Default 15 minutes. |
+| `--cache-dir <path>` | Cache directory. `XAVIER_CACHE_DIR` also works. |
+| `--replay <file>` | Render a raw xAI response or a xavier cache entry offline. |
+
+The cache directory is `XAVIER_CACHE_DIR` when set, otherwise `~/Library/Caches/xavier`
+on macOS, `%LOCALAPPDATA%\xavier` on Windows, or `$XDG_CACHE_HOME/xavier`
+(`~/.cache/xavier` fallback) elsewhere. Entries are written atomically with `0600`
+permissions. Cached post text is stored as plain JSON readable by your user account;
+delete the cache directory to clear it. Corrupt or expired entries are ignored and removed.
+
+Cache hits are resolved before `XAI_API_KEY` is checked, so repeat queries and `--replay`
+work offline. `--raw` runs may read a cached payload but never write one; `--dry-run` does
+not touch the cache. Replay does not require a key and never makes a request.
+
 ### Other flags
 
 | Flag | Description |
@@ -236,3 +264,14 @@ A budget cannot undo spend from the request that already completed.
 | 1 | API, network, or response error. |
 | 2 | Usage or configuration error (bad flag, missing key). |
 | 4 | Budget refusal: the window spend plus the preflight estimate exceeds `--budget-usd`. |
+
+## Architecture
+
+- `src/cli.rs` — command flow: replay, cache lookup, budget preflight, request, store, ledger, render.
+- `src/cache.rs` — SHA-256 cache keys, directory resolution, atomic load/store, replay parsing.
+- `src/ledger.rs` — JSONL ledger, spend aggregation, stats, and budget checks.
+- `src/xai.rs` — request construction, xAI HTTP, response normalization and citations.
+- `src/output.rs` — Markdown, JSON, JSONL, and stats rendering.
+- `src/args.rs` — flags, `CacheMode`, `LedgerMode`, `stats` parsing, option validation.
+- `src/dates.rs` — date and duration parsing.
+- `src/cost.rs`, `src/errors.rs`, `src/types.rs` — cost estimates, errors, shared types.

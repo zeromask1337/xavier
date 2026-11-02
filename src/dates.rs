@@ -98,41 +98,33 @@ pub fn parse_when(input: &str, now: &DateTime<Utc>) -> Result<String> {
     )))
 }
 
-/// Parse a duration such as `30d`, `12h`, `90m`, `45s`, or `2w` into seconds.
+/// Parse a duration such as `15m`, `1h`, or `7d` into seconds.
 pub fn parse_duration_seconds(input: &str) -> Result<u64> {
-    let raw = input.trim().to_ascii_lowercase();
-    let Some(unit) = raw.chars().last() else {
-        return Err(AppError::usage(
-            "Duration is empty. Use a value like 30d, 12h, or 2w.",
-        ));
+    let raw = input.trim();
+    let lower = raw.to_ascii_lowercase();
+    let Some((amount, unit)) = parse_duration_parts(&lower) else {
+        return Err(AppError::usage(format!(
+            "Invalid duration \"{input}\". Use a value like 15m, 1h, or 7d."
+        )));
     };
-    let unit_seconds: u64 = match unit {
+    let multiplier: u64 = match unit {
         's' => 1,
         'm' => 60,
         'h' => 3_600,
         'd' => 86_400,
-        'w' => 7 * 86_400,
-        _ => {
-            return Err(AppError::usage(format!(
-                "Invalid duration \"{input}\". Use a value like 30d, 12h, or 2w."
-            )));
-        }
+        'w' => 604_800,
+        _ => unreachable!("parse_duration_parts only returns s/m/h/d/w"),
     };
-    let prefix = raw[..raw.len() - unit.len_utf8()].trim_end();
-    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(AppError::usage(format!(
-            "Invalid duration \"{input}\". Use a value like 30d, 12h, or 2w."
-        )));
-    }
-    let amount = prefix
-        .parse::<u64>()
-        .map_err(|_| AppError::usage(format!("Duration \"{input}\" is too large.")))?;
-    if amount == 0 {
-        return Err(AppError::usage("Duration must be greater than zero."));
-    }
-    amount
-        .checked_mul(unit_seconds)
-        .ok_or_else(|| AppError::usage(format!("Duration \"{input}\" is too large.")))
+    let amount = u64::try_from(amount)
+        .ok()
+        .and_then(|amount| amount.checked_mul(multiplier))
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| {
+            AppError::usage(format!(
+                "Invalid duration \"{input}\". Use a positive value like 15m, 1h, or 7d."
+            ))
+        })?;
+    Ok(amount)
 }
 
 /// Render seconds using the largest whole unit, e.g. `30d` or `90m`.
@@ -154,6 +146,20 @@ pub fn add_days(date: &str, days: i64) -> Result<String> {
         .checked_add_signed(duration)
         .ok_or_else(|| AppError::usage(format!("Invalid date \"{date}\".")))?;
     Ok(shifted.format("%Y-%m-%d").to_string())
+}
+
+/// Parse `^(\d+)\s*(s|m|h|d|w)$` after lower-casing.
+fn parse_duration_parts(value: &str) -> Option<(u128, char)> {
+    let unit = value.chars().last()?;
+    if !matches!(unit, 's' | 'm' | 'h' | 'd' | 'w') {
+        return None;
+    }
+    let prefix = value[..value.len() - unit.len_utf8()].trim_end();
+    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let amount = prefix.parse::<u128>().ok()?;
+    Some((amount, unit))
 }
 
 /// Parse `^(\d+)\s*(m|h|d|w)$` after lower-casing.
@@ -312,6 +318,11 @@ mod tests {
         assert_eq!(parse_duration_seconds("90m").unwrap(), 5_400);
         assert_eq!(parse_duration_seconds("45s").unwrap(), 45);
         assert_eq!(parse_duration_seconds("2w").unwrap(), 1_209_600);
+        assert_eq!(parse_duration_seconds("15m").unwrap(), 900);
+        assert_eq!(parse_duration_seconds("1h").unwrap(), 3_600);
+        assert_eq!(parse_duration_seconds("7d").unwrap(), 604_800);
+        assert_eq!(parse_duration_seconds("30s").unwrap(), 30);
+        assert_eq!(parse_duration_seconds(" 15M ").unwrap(), 900);
         assert_eq!(format_duration_seconds(2_592_000), "30d");
         assert_eq!(format_duration_seconds(5_400), "90m");
         assert_eq!(format_duration_seconds(3_601), "3601s");
@@ -323,8 +334,12 @@ mod tests {
         assert!(parse_duration_seconds("30").is_err());
         assert!(parse_duration_seconds("d").is_err());
         assert!(parse_duration_seconds("0d").is_err());
+        assert!(parse_duration_seconds("0m").is_err());
+        assert!(parse_duration_seconds("15").is_err());
+        assert!(parse_duration_seconds("fifteen minutes").is_err());
         assert!(parse_duration_seconds("1.5h").is_err());
         assert!(parse_duration_seconds("30y").is_err());
+        assert!(parse_duration_seconds("999999999999999999999999999999h").is_err());
     }
 
     #[test]
