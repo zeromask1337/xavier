@@ -1,7 +1,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -37,8 +38,12 @@ impl TestServer {
         let mut stub: Value = serde_json::from_str(FIXTURE).expect("fixture");
         stub["output"][2]["content"][0]["text"] =
             Value::String(r#"{"summary":"placeholder","posts":[]}"#.to_string());
+        let mut empty: Value = serde_json::from_str(FIXTURE).expect("fixture");
+        empty["output"][2]["content"][0]["text"] =
+            Value::String(r#"{"summary":"No matching posts.","posts":[]}"#.to_string());
         let fixture = Arc::new(FIXTURE.to_string());
         let stub = Arc::new(stub.to_string());
+        let empty = Arc::new(empty.to_string());
 
         let thread_requests = Arc::clone(&requests);
         let thread_stop = Arc::clone(&stop);
@@ -49,8 +54,9 @@ impl TestServer {
                         let requests = Arc::clone(&thread_requests);
                         let fixture = Arc::clone(&fixture);
                         let stub = Arc::clone(&stub);
+                        let empty = Arc::clone(&empty);
                         thread::spawn(move || {
-                            let _ = handle_connection(stream, requests, fixture, stub);
+                            let _ = handle_connection(stream, requests, fixture, stub, empty);
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -92,6 +98,7 @@ fn handle_connection(
     requests: Arc<Mutex<Vec<RequestRecord>>>,
     fixture: Arc<String>,
     stub: Arc<String>,
+    empty: Arc<String>,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -154,6 +161,7 @@ fn handle_connection(
     let (status, content_type, payload) = match path.as_str() {
         "/v1/responses" => (200, "application/json", fixture.as_str()),
         "/v1/stub/responses" => (200, "application/json", stub.as_str()),
+        "/v1/empty/responses" => (200, "application/json", empty.as_str()),
         "/v1/unauthorized/responses" => (
             401,
             "application/json",
@@ -183,24 +191,91 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn command(server: &TestServer) -> Command {
+    static CACHE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let isolated_cache = std::env::temp_dir().join(format!(
+        "xavier-cli-isolated-{}-{}",
+        std::process::id(),
+        CACHE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
     let mut command = Command::new(env!("CARGO_BIN_EXE_xavier"));
     command
         .env_remove("XAI_API_KEY")
         .env_remove("XAI_BASE_URL")
         .env_remove("XAVIER_MODEL")
+        .env_remove("XAVIER_CACHE_DIR")
         .env("XAI_API_KEY", "test-key")
         .env("XAI_BASE_URL", server.base_url())
+        .env("XAVIER_CACHE_DIR", isolated_cache)
         .stdin(Stdio::null());
     command
 }
 
 fn run_cli(server: &TestServer, args: &[&str], env: &[(&str, &str)]) -> Output {
+    run_cli_with_cache_override(server, None, args, env)
+}
+
+fn run_cli_with_cache(
+    server: &TestServer,
+    cache_dir: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Output {
+    run_cli_with_cache_override(server, Some(cache_dir), args, env)
+}
+
+fn run_cli_with_cache_override(
+    server: &TestServer,
+    cache_dir: Option<&Path>,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Output {
     let mut command = command(server);
     command.args(args);
+    if let Some(cache_dir) = cache_dir {
+        command.env("XAVIER_CACHE_DIR", cache_dir);
+    }
     for (key, value) in env {
         command.env(key, value);
     }
     command.output().expect("run xavier")
+}
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "xavier-cli-test-{}-{}-{}",
+            std::process::id(),
+            label,
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(&self.path)
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 fn run_cli_stdin(server: &TestServer, args: &[&str], input: &str) -> Output {
@@ -375,6 +450,190 @@ fn prints_diagnostics_on_stderr_when_verbose() {
     assert!(text.contains("xavier: model=grok-4.7 effort=low max_turns=3"));
     assert!(text.contains("xavier: search x_keyword_search \"grok 4.7\" (Latest)"));
     assert!(text.contains("xavier: response=resp_test_123 posts=2 fetched=3"));
+}
+
+#[test]
+fn second_run_hits_cache_without_an_api_key() {
+    let server = TestServer::start();
+    let cache = TempDir::new("hit");
+
+    let first = run_cli_with_cache(&server, cache.path(), &["grok 4.7", "--json"], &[]);
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", stderr(&first));
+    let first: Value = serde_json::from_str(&stdout(&first)).unwrap();
+    assert_eq!(first["meta"]["cache"]["hit"], false);
+    assert_eq!(server.requests().len(), 1);
+
+    let second = run_cli_with_cache(
+        &server,
+        cache.path(),
+        &["grok 4.7", "--json"],
+        &[("XAI_API_KEY", "")],
+    );
+    assert_eq!(second.status.code(), Some(0), "stderr: {}", stderr(&second));
+    let second: Value = serde_json::from_str(&stdout(&second)).unwrap();
+    assert_eq!(second["meta"]["cache"]["hit"], true);
+    assert_eq!(second["meta"]["cache"]["saved_usd"], 0.001234);
+    assert!(second["meta"]["cache"]["age_seconds"].as_u64().is_some());
+    assert_eq!(second["posts"].as_array().unwrap().len(), 2);
+    assert_eq!(server.requests().len(), 1);
+
+    let markdown = run_cli_with_cache(&server, cache.path(), &["grok 4.7"], &[("XAI_API_KEY", "")]);
+    assert_eq!(
+        markdown.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&markdown)
+    );
+    assert!(stdout(&markdown).contains("cache=hit"));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn refresh_bypasses_the_cache() {
+    let server = TestServer::start();
+    let cache = TempDir::new("refresh");
+
+    let first = run_cli_with_cache(&server, cache.path(), &["grok 4.7", "--json"], &[]);
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", stderr(&first));
+
+    let second = run_cli_with_cache(
+        &server,
+        cache.path(),
+        &["grok 4.7", "--refresh", "--json"],
+        &[],
+    );
+    assert_eq!(second.status.code(), Some(0), "stderr: {}", stderr(&second));
+    let second: Value = serde_json::from_str(&stdout(&second)).unwrap();
+    assert_eq!(second["meta"]["cache"]["hit"], false);
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[test]
+fn cache_off_bypasses_reads_and_writes() {
+    let server = TestServer::start();
+    let cache = TempDir::new("off");
+
+    let first = run_cli_with_cache(&server, cache.path(), &["grok 4.7", "--json"], &[]);
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", stderr(&first));
+    assert_eq!(cache.files().len(), 1);
+
+    let second = run_cli_with_cache(
+        &server,
+        cache.path(),
+        &["grok 4.7", "--no-cache", "--json"],
+        &[],
+    );
+    assert_eq!(second.status.code(), Some(0), "stderr: {}", stderr(&second));
+    let second: Value = serde_json::from_str(&stdout(&second)).unwrap();
+    assert!(second["meta"].get("cache").is_none());
+    assert_eq!(server.requests().len(), 2);
+    assert_eq!(cache.files().len(), 1);
+
+    let offline = run_cli_with_cache(
+        &server,
+        cache.path(),
+        &["grok 4.7", "--cache", "off"],
+        &[("XAI_API_KEY", "")],
+    );
+    assert_eq!(offline.status.code(), Some(2));
+    assert!(stderr(&offline).contains("XAI_API_KEY is not set"));
+    assert_eq!(server.requests().len(), 2);
+
+    let empty = TempDir::new("off-writes");
+    let third = run_cli_with_cache(&server, empty.path(), &["grok 4.7", "--cache=off"], &[]);
+    assert_eq!(third.status.code(), Some(0), "stderr: {}", stderr(&third));
+    assert!(empty.files().is_empty());
+}
+
+#[test]
+fn replay_renders_raw_responses_and_cache_entries_offline() {
+    let server = TestServer::start();
+    let replay_dir = TempDir::new("replay");
+    let raw_path = replay_dir.path().join("response.json");
+    std::fs::write(&raw_path, FIXTURE).expect("write raw response");
+
+    let raw = run_cli(
+        &server,
+        &["--replay", raw_path.to_str().unwrap(), "--json"],
+        &[("XAI_API_KEY", "")],
+    );
+    assert_eq!(raw.status.code(), Some(0), "stderr: {}", stderr(&raw));
+    let parsed: Value = serde_json::from_str(&stdout(&raw)).unwrap();
+    assert_eq!(parsed["posts"].as_array().unwrap().len(), 2);
+    assert!(parsed["meta"].get("cache").is_none());
+    assert!(server.requests().is_empty());
+
+    let cache = TempDir::new("replay-entry");
+    let first = run_cli_with_cache(&server, cache.path(), &["grok 4.7"], &[]);
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", stderr(&first));
+    assert_eq!(server.requests().len(), 1);
+    let entries = cache.files();
+    assert_eq!(entries.len(), 1);
+
+    let entry = run_cli(
+        &server,
+        &["--replay", entries[0].to_str().unwrap(), "--json"],
+        &[("XAI_API_KEY", "")],
+    );
+    assert_eq!(entry.status.code(), Some(0), "stderr: {}", stderr(&entry));
+    let parsed: Value = serde_json::from_str(&stdout(&entry)).unwrap();
+    assert_eq!(parsed["posts"].as_array().unwrap().len(), 2);
+    assert_eq!(parsed["query"], "grok 4.7");
+    assert!(parsed["meta"].get("cache").is_none());
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn raw_runs_can_read_cached_payloads_without_writing() {
+    let server = TestServer::start();
+    let cache = TempDir::new("raw-hit");
+
+    let first = run_cli_with_cache(&server, cache.path(), &["grok 4.7"], &[]);
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", stderr(&first));
+    assert_eq!(server.requests().len(), 1);
+
+    let raw = run_cli_with_cache(
+        &server,
+        cache.path(),
+        &["grok 4.7", "--raw"],
+        &[("XAI_API_KEY", "")],
+    );
+    assert_eq!(raw.status.code(), Some(0), "stderr: {}", stderr(&raw));
+    let parsed: Value = serde_json::from_str(&stdout(&raw)).unwrap();
+    assert_eq!(parsed["id"], "resp_test_123");
+    assert_eq!(server.requests().len(), 1);
+
+    let fresh = TempDir::new("raw-miss");
+    let miss = run_cli_with_cache(&server, fresh.path(), &["new query", "--raw"], &[]);
+    assert_eq!(miss.status.code(), Some(0), "stderr: {}", stderr(&miss));
+    assert!(fresh.files().is_empty());
+}
+
+#[test]
+fn caches_zero_post_results() {
+    let server = TestServer::start();
+    let cache = TempDir::new("negative");
+    let base = format!("{}/empty", server.base_url());
+    let env = [("XAI_BASE_URL", base.as_str())];
+
+    let first = run_cli_with_cache(&server, cache.path(), &["no such post", "--json"], &env);
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", stderr(&first));
+    let first: Value = serde_json::from_str(&stdout(&first)).unwrap();
+    assert!(first["posts"].as_array().unwrap().is_empty());
+    assert_eq!(first["meta"]["cache"]["hit"], false);
+    assert_eq!(server.requests().len(), 1);
+
+    let second = run_cli_with_cache(
+        &server,
+        cache.path(),
+        &["no such post", "--json"],
+        &[("XAI_BASE_URL", base.as_str()), ("XAI_API_KEY", "")],
+    );
+    assert_eq!(second.status.code(), Some(0), "stderr: {}", stderr(&second));
+    let second: Value = serde_json::from_str(&stdout(&second)).unwrap();
+    assert!(second["posts"].as_array().unwrap().is_empty());
+    assert_eq!(second["meta"]["cache"]["hit"], true);
+    assert_eq!(server.requests().len(), 1);
 }
 
 #[test]
