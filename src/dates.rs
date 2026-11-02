@@ -98,6 +98,35 @@ pub fn parse_when(input: &str, now: &DateTime<Utc>) -> Result<String> {
     )))
 }
 
+/// Parse a duration such as `15m`, `1h`, or `7d` into seconds.
+pub fn parse_duration_seconds(input: &str) -> Result<u64> {
+    let raw = input.trim();
+    let lower = raw.to_ascii_lowercase();
+    let Some((amount, unit)) = parse_duration_parts(&lower) else {
+        return Err(AppError::usage(format!(
+            "Invalid duration \"{input}\". Use a value like 15m, 1h, or 7d."
+        )));
+    };
+    let multiplier: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        'w' => 604_800,
+        _ => unreachable!("parse_duration_parts only returns s/m/h/d/w"),
+    };
+    let amount = u64::try_from(amount)
+        .ok()
+        .and_then(|amount| amount.checked_mul(multiplier))
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| {
+            AppError::usage(format!(
+                "Invalid duration \"{input}\". Use a positive value like 15m, 1h, or 7d."
+            ))
+        })?;
+    Ok(amount)
+}
+
 /// Add days to a YYYY-MM-DD string, returning a YYYY-MM-DD string.
 pub fn add_days(date: &str, days: i64) -> Result<String> {
     let parsed = parse_date(date)?;
@@ -107,6 +136,20 @@ pub fn add_days(date: &str, days: i64) -> Result<String> {
         .checked_add_signed(duration)
         .ok_or_else(|| AppError::usage(format!("Invalid date \"{date}\".")))?;
     Ok(shifted.format("%Y-%m-%d").to_string())
+}
+
+/// Parse `^(\d+)\s*(s|m|h|d|w)$` after lower-casing.
+fn parse_duration_parts(value: &str) -> Option<(u128, char)> {
+    let unit = value.chars().last()?;
+    if !matches!(unit, 's' | 'm' | 'h' | 'd' | 'w') {
+        return None;
+    }
+    let prefix = value[..value.len() - unit.len_utf8()].trim_end();
+    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let amount = prefix.parse::<u128>().ok()?;
+    Some((amount, unit))
 }
 
 /// Parse `^(\d+)\s*(m|h|d|w)$` after lower-casing.
@@ -256,6 +299,25 @@ mod tests {
         assert!(parse_when("last tuesday", &now()).is_err());
         assert!(parse_when("2026-02-30", &now()).is_err());
         assert!(parse_when("", &now()).is_err());
+    }
+
+    #[test]
+    fn parses_durations_into_seconds() {
+        assert_eq!(parse_duration_seconds("15m").unwrap(), 900);
+        assert_eq!(parse_duration_seconds("1h").unwrap(), 3_600);
+        assert_eq!(parse_duration_seconds("7d").unwrap(), 604_800);
+        assert_eq!(parse_duration_seconds("30s").unwrap(), 30);
+        assert_eq!(parse_duration_seconds("2w").unwrap(), 1_209_600);
+        assert_eq!(parse_duration_seconds(" 15M ").unwrap(), 900);
+    }
+
+    #[test]
+    fn rejects_invalid_durations() {
+        assert!(parse_duration_seconds("0m").is_err());
+        assert!(parse_duration_seconds("15").is_err());
+        assert!(parse_duration_seconds("fifteen minutes").is_err());
+        assert!(parse_duration_seconds("").is_err());
+        assert!(parse_duration_seconds("999999999999999999999999999999h").is_err());
     }
 
     #[test]

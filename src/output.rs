@@ -8,7 +8,7 @@ pub fn render_markdown(result: &SearchResult) -> String {
         String::new(),
     ];
 
-    let stats = format!(
+    let mut stats = format!(
         "model={} effort={} posts={} fetched={} searches={} cost_usd={} cost_source={} elapsed_ms={} limit={}",
         result.meta.model,
         result.meta.effort.as_str(),
@@ -27,6 +27,13 @@ pub fn render_markdown(result: &SearchResult) -> String {
         result.meta.elapsed_ms,
         result.meta.filters.limit,
     );
+    if let Some(cache) = &result.meta.cache {
+        stats.push_str(if cache.hit {
+            " cache=hit"
+        } else {
+            " cache=miss"
+        });
+    }
     lines.push(stats);
 
     let mut filters = Vec::new();
@@ -192,6 +199,10 @@ mod tests {
             timeout_ms: 180_000,
             dry_run: false,
             verbose: false,
+            cache: crate::args::CacheMode::On,
+            cache_ttl_seconds: 900,
+            cache_dir: None,
+            replay: None,
         }
     }
 
@@ -234,6 +245,32 @@ mod tests {
             post.verified = false;
         }
         assert!(render_markdown(&unverified).contains("| unverified"));
+    }
+
+    #[test]
+    fn renders_cache_metadata_in_markdown_and_json() {
+        let mut hit = result();
+        hit.meta.cache = Some(crate::types::CacheMeta {
+            hit: true,
+            age_seconds: Some(42),
+            saved_usd: Some(0.001234),
+        });
+
+        let markdown = render_markdown(&hit);
+        assert!(markdown.contains("cache=hit"));
+
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&hit)).unwrap();
+        assert_eq!(parsed["meta"]["cache"]["hit"], true);
+        assert_eq!(parsed["meta"]["cache"]["age_seconds"], 42);
+        assert_eq!(parsed["meta"]["cache"]["saved_usd"], 0.001234);
+
+        let mut miss = result();
+        miss.meta.cache = Some(crate::types::CacheMeta {
+            hit: false,
+            age_seconds: None,
+            saved_usd: None,
+        });
+        assert!(render_markdown(&miss).contains("cache=miss"));
     }
 
     #[test]

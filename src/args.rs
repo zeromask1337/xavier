@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
-use crate::dates::{add_days, parse_when};
+use crate::dates::{add_days, parse_duration_seconds, parse_when};
 use crate::errors::{AppError, Result};
 use crate::types::{Effort, SortMode};
 
@@ -10,6 +11,7 @@ pub const DEFAULT_MODEL: &str = "grok-4.7";
 pub const DEFAULT_LIMIT: usize = 20;
 pub const DEFAULT_MAX_TURNS: usize = 3;
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 180;
+pub const DEFAULT_CACHE_TTL_SECONDS: u64 = 900;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -17,6 +19,23 @@ pub enum OutputFormat {
     Json,
     Jsonl,
     Raw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMode {
+    On,
+    Off,
+    Refresh,
+}
+
+impl CacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Refresh => "refresh",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,13 +56,17 @@ pub struct Options {
     pub timeout_ms: u64,
     pub dry_run: bool,
     pub verbose: bool,
+    pub cache: CacheMode,
+    pub cache_ttl_seconds: u64,
+    pub cache_dir: Option<PathBuf>,
+    pub replay: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedCli {
     Help,
     Version,
-    Run(Options),
+    Run(Box<Options>),
 }
 
 #[derive(Debug, Default)]
@@ -70,6 +93,12 @@ struct RawValues {
     timeout: Option<String>,
     dry_run: bool,
     verbose: bool,
+    cache: Option<String>,
+    no_cache: bool,
+    refresh: bool,
+    cache_ttl: Option<String>,
+    cache_dir: Option<String>,
+    replay: Option<String>,
 }
 
 pub fn parse_cli(
@@ -115,6 +144,39 @@ pub fn parse_cli(
                 "videos" => set_bool(&mut values.videos, attached, "--videos")?,
                 "dry-run" => set_bool(&mut values.dry_run, attached, "--dry-run")?,
                 "verbose" => set_bool(&mut values.verbose, attached, "--verbose")?,
+                "no-cache" => set_bool(&mut values.no_cache, attached, "--no-cache")?,
+                "refresh" => set_bool(&mut values.refresh, attached, "--refresh")?,
+                "cache" => {
+                    values.cache =
+                        Some(take_value(attached, argv, index, &mut consumed, "--cache")?)
+                }
+                "cache-ttl" => {
+                    values.cache_ttl = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--cache-ttl",
+                    )?)
+                }
+                "cache-dir" => {
+                    values.cache_dir = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--cache-dir",
+                    )?)
+                }
+                "replay" => {
+                    values.replay = Some(take_value(
+                        attached,
+                        argv,
+                        index,
+                        &mut consumed,
+                        "--replay",
+                    )?)
+                }
                 "model" => {
                     values.model =
                         Some(take_value(attached, argv, index, &mut consumed, "--model")?)
@@ -280,6 +342,25 @@ pub fn parse_cli(
         .map(|(_, format)| *format)
         .unwrap_or(OutputFormat::Md);
 
+    let cache = parse_cache_mode(&values)?;
+    let cache_ttl_seconds = match values.cache_ttl.as_deref() {
+        Some(raw) => parse_duration_seconds(raw)?,
+        None => DEFAULT_CACHE_TTL_SECONDS,
+    };
+    let cache_dir = match values.cache_dir {
+        Some(raw) => Some(parse_path_value(raw, "--cache-dir")?),
+        None => None,
+    };
+    let replay = match values.replay {
+        Some(raw) => Some(parse_path_value(raw, "--replay")?),
+        None => None,
+    };
+    if replay.is_some() && values.dry_run {
+        return Err(AppError::usage(
+            "Use either --replay or --dry-run, not both.",
+        ));
+    }
+
     let handles = collect_handles(&values.handle, "--handle")?;
     let exclude_handles = collect_handles(&values.exclude_handle, "--exclude-handle")?;
     if !handles.is_empty() && !exclude_handles.is_empty() {
@@ -347,7 +428,7 @@ pub fn parse_cli(
     let effort = parse_effort(values.effort.as_deref())?;
     let sort = parse_sort(values.sort.as_deref())?;
 
-    Ok(ParsedCli::Run(Options {
+    Ok(ParsedCli::Run(Box::new(Options {
         query,
         format,
         model,
@@ -364,7 +445,45 @@ pub fn parse_cli(
         timeout_ms: timeout_seconds as u64 * 1000,
         dry_run: values.dry_run,
         verbose: values.verbose,
-    }))
+        cache,
+        cache_ttl_seconds,
+        cache_dir,
+        replay,
+    })))
+}
+
+fn parse_cache_mode(values: &RawValues) -> Result<CacheMode> {
+    let selected = usize::from(values.cache.is_some())
+        + usize::from(values.no_cache)
+        + usize::from(values.refresh);
+    if selected > 1 {
+        return Err(AppError::usage(
+            "Use only one of --cache, --no-cache, and --refresh.",
+        ));
+    }
+    if values.no_cache {
+        return Ok(CacheMode::Off);
+    }
+    if values.refresh {
+        return Ok(CacheMode::Refresh);
+    }
+    match values.cache.as_deref() {
+        None => Ok(CacheMode::On),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "on" => Ok(CacheMode::On),
+            "off" => Ok(CacheMode::Off),
+            "refresh" => Ok(CacheMode::Refresh),
+            _ => Err(AppError::usage("--cache must be on, off, or refresh.")),
+        },
+    }
+}
+
+fn parse_path_value(raw: String, flag: &str) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::usage(format!("{flag} requires a file path.")));
+    }
+    Ok(PathBuf::from(trimmed))
 }
 
 /// Inclusive calendar end date => exclusive xAI `to_date`.
@@ -525,6 +644,14 @@ OUTPUT
   --jsonl      Result metadata line, then one post per line
   --raw        Raw xAI Responses API payload
   --dry-run    Print the API request body and exit without spending credits
+  --replay <file>  Render a raw response or cache entry offline
+
+CACHE
+      --cache <mode>             on | off | refresh (default on)
+      --no-cache                 Alias for --cache off
+      --refresh                  Alias for --cache refresh
+      --cache-ttl <duration>     Entry lifetime: 15m, 1h, 7d (default 15m)
+      --cache-dir <path>         Cache directory (or XAVIER_CACHE_DIR)
 
 FILTERS
   -u, --handle <handle>          Only these authors (repeatable, comma-separated, max 20)
@@ -579,7 +706,7 @@ mod tests {
     fn options_with(argv: &[&str], env_pairs: &[(&str, &str)]) -> Options {
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
         match parse_cli(&argv, &env(env_pairs), now()).expect("expected a run command") {
-            ParsedCli::Run(options) => options,
+            ParsedCli::Run(options) => *options,
             other => panic!("expected run, got {other:?}"),
         }
     }
@@ -599,6 +726,10 @@ mod tests {
         assert_eq!(options.max_turns, 3);
         assert_eq!(options.effort, Effort::Low);
         assert_eq!(options.timeout_ms, 180_000);
+        assert_eq!(options.cache, CacheMode::On);
+        assert_eq!(options.cache_ttl_seconds, 900);
+        assert_eq!(options.cache_dir, None);
+        assert_eq!(options.replay, None);
     }
 
     #[test]
@@ -706,6 +837,36 @@ mod tests {
         assert!(options.images);
         assert!(options.videos);
         assert!(options.dry_run);
+    }
+
+    #[test]
+    fn parses_cache_modes_and_aliases() {
+        assert_eq!(run(&["--cache", "off"]).cache, CacheMode::Off);
+        assert_eq!(run(&["--cache=refresh"]).cache, CacheMode::Refresh);
+        assert_eq!(run(&["--cache", "on"]).cache, CacheMode::On);
+        assert_eq!(run(&["--no-cache"]).cache, CacheMode::Off);
+        assert_eq!(run(&["--refresh"]).cache, CacheMode::Refresh);
+        assert!(error(&["--cache", "maybe"]).is_usage());
+        assert!(error(&["--no-cache", "--refresh"]).is_usage());
+        assert!(error(&["--cache", "off", "--no-cache"]).is_usage());
+    }
+
+    #[test]
+    fn parses_cache_ttl_and_paths() {
+        assert_eq!(run(&["--cache-ttl", "1h"]).cache_ttl_seconds, 3_600);
+        assert_eq!(run(&["--cache-ttl=7d"]).cache_ttl_seconds, 604_800);
+        assert_eq!(
+            run(&["--cache-dir", "/tmp/xavier-cache"]).cache_dir,
+            Some(PathBuf::from("/tmp/xavier-cache"))
+        );
+        assert_eq!(
+            run(&["--replay", "result.json"]).replay,
+            Some(PathBuf::from("result.json"))
+        );
+        assert!(error(&["--cache-ttl", "15"]).is_usage());
+        assert!(error(&["--cache-dir", ""]).is_usage());
+        assert!(error(&["--replay", ""]).is_usage());
+        assert!(error(&["--replay", "result.json", "--dry-run"]).is_usage());
     }
 
     #[test]
